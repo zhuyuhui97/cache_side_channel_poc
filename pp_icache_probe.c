@@ -37,7 +37,7 @@
     asm volatile("mfence");                                                    \
     NOP(x);
 #define FLUSH_ICACHE(p)                                                        \
-    asm volatile("clflush (%0)" ::"r"(test_target));
+    asm volatile("clflush (%0)" ::"r"(p));
 #define OPCODE_RET (0xC3C3C3C3UL)
 #define NR_OPCODE_ALIGN 0
 #elif defined(__aarch64__)
@@ -46,7 +46,7 @@
     asm volatile("isb");                                                       \
     NOP(x);
 #define FLUSH_ICACHE(p)                                                        \
-    asm volatile("ic ivau, %0\n dc civac, %0" ::"r"(test_target));
+    asm volatile("ic ivau, %0\n dc civac, %0" ::"r"(p));
 #define OPCODE_RET (0xD65F03C0UL)
 #define NR_OPCODE_ALIGN 2
 #endif
