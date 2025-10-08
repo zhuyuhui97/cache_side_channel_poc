@@ -60,7 +60,7 @@ uint64_t tramp_bits = TRAMP_BITS_DEFAULT;
 uint64_t tramp_size = (1 << TRAMP_BITS_DEFAULT);
 uint64_t cache_ways = 16;
 uint64_t cache_idx_bits = 20;
-uint64_t cache_line_sz = 64;
+uint64_t cache_offset_bits = 6;
 uint64_t offset_dbg_probe = OFFSET_PROBE_INPAGE;
 bool do_eviction = false;
 void *ret_tramp;
@@ -69,10 +69,10 @@ static struct argp_option options[] = {
     {"tramp", 't', "TRAMPOLINE_BASE", 0, "Base address of trampoline."},
     {"ways", 'w', "CACHE_WAYS", 0, "Number of ways."},
     {"bits", 'b', "CACHE_IDX_BITS", 0, "Number of index bits."},
-    {"line", 'l', "CACHE_LINE_SZ", 0, "Size of cache line, default 64b."},
+    {"offset", 'o', "CACHE_OFFSET_BITS", 0, "Size of cache line, default 64b."},
     {"size", 's', "TRAMPOLINE_BITS", 0,
      "Bits of address span of the RET trampoline, size=(1<<TRAMPOLINE_BITS)."},
-    {"offset", 'o', "OFFSET", 0, "DEBUG: test offset of P+P probe"},
+    {"probe", 'p', "OFFSET", 0, "DEBUG: test offset of P+P probe"},
     {"evict", 'e', NULL, 0, "DEBUG: do eviction"},
     {0}};
 
@@ -89,14 +89,14 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
     case 'b':
         cache_idx_bits = strtoull(arg, NULL, 0);
         break;
-    case 'l':
-        cache_line_sz = strtoull(arg, NULL, 0);
+    case 'o':
+        cache_offset_bits = strtoull(arg, NULL, 0);
         break;
     case 's':
         tramp_bits = strtoull(arg, NULL, 0);
         tramp_size = 1 << tramp_bits;
         break;
-    case 'o':
+    case 'p':
         offset_dbg_probe = strtoull(arg, NULL, 0);
         break;
     case 'e':
@@ -149,7 +149,7 @@ void fill_bhb(void) {
 }
 
 uint64_t read_cycles() {
-#if !defined(TIMER_HW)
+#if !defined(DBG_TIMER_HW)
 #define NANOSECONDS_PER_SECOND 1000000000L
     struct timespec tp;
     clockid_t clk_id = CLOCK_REALTIME;
@@ -357,7 +357,12 @@ void test_evict2(void *test_cursor, void *ev_base, uint64_t ev_size, uint64_t nr
     for (int i = 0; i < nr_ev; i++) {
         uintptr_t paddr;
         virt_to_phys_user(&paddr, pid, (uintptr_t)evset[i]);
-        printf("%d\tv=%p\tp=%p\t%"PRIu64"\n", i, evset[i], (void*)paddr, latency[i]);
+        printf("%d\tv=%p\tp=%p\tp_idx=%8x\t%"PRIu64"\n",
+               i,
+               evset[i],
+               (void*)paddr,
+               ((paddr&((1<<cache_idx_bits)-1))>>cache_offset_bits),
+               latency[i]);
     }
 
     free(evset);
@@ -372,6 +377,7 @@ void print_env() {
     printf("Cache ways: %" PRIu64 "\n", cache_ways);
     printf("Cache index bits: %" PRIu64 " (cover %llu bytes)\n", cache_idx_bits,
            (1ULL << cache_idx_bits));
+    printf("Cache offset bits: %" PRIu64 "\n", cache_offset_bits);
     printf("Trampoline size: %" PRIu64 " bytes\n", tramp_size);
     printf("\n");
 }
