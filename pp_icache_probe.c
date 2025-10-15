@@ -63,7 +63,11 @@ uint64_t cache_idx_bits = 20;
 uint64_t cache_offset_bits = 6;
 uint64_t offset_dbg_probe = OFFSET_PROBE_INPAGE;
 bool do_eviction = false;
-void *ret_tramp;
+void *tramp;
+
+extern uint8_t prime_snippet, prime_snippet_end;
+void probe_wrapper_head(uint64_t* buf);
+extern uint8_t probe_wrapper_tail, probe_wrapper_end;
 
 static struct argp_option options[] = {
     {"tramp", 't', "TRAMPOLINE_BASE", 0, "Base address of trampoline."},
@@ -88,6 +92,10 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
         break;
     case 'b':
         cache_idx_bits = strtoull(arg, NULL, 0);
+        if (cache_idx_bits < 6) {
+            fprintf(stderr, "error: cache_idx_bits must be >= 6\n");
+            return ARGP_ERR_UNKNOWN;
+        }
         break;
     case 'o':
         cache_offset_bits = strtoull(arg, NULL, 0);
@@ -133,15 +141,15 @@ void *create_ret_tramp(uint32_t size, void *base) {
 }
 
 void fill_bhb(void) {
-    void *_cursor = ret_tramp + 0x9200;
-    uintptr_t end = (uintptr_t)ret_tramp + tramp_size;
+    void *_cursor = tramp + 0x9200;
+    uintptr_t end = (uintptr_t)tramp + tramp_size;
     for (int i = 0; i < FILL_BHB_LEN; i++) {
         _cursor += (1 << NR_OPCODE_ALIGN);
         { // _cursor = (_cursor>=(ret_tramp+tramp_size)) ? ret_tramp : _cursor;
             uintptr_t cur = (uintptr_t)_cursor;
             // all-ones if cur >= end, else 0
             uintptr_t mask = -(uintptr_t)(cur >= end);
-            cur = (cur & ~mask) | ((uintptr_t)ret_tramp & mask);
+            cur = (cur & ~mask) | ((uintptr_t)tramp & mask);
             _cursor = (void *)cur;
         }
         CALL_ADDR(_cursor);
@@ -198,7 +206,7 @@ void train_bcond(void *valid_target) {
 void test_icache_latency(uint64_t *fast, uint64_t *slow) {
     // test branch latency when target in icache
     // TODO: MAGIC NUMBER HERE
-    void *test_target = ret_tramp + 0xc20;
+    void *test_target = tramp + 0xc20;
     printf("Test addr: %p\n", test_target);
     fflush(stdout);
     for (int i = 0; i < 4; i++)
@@ -301,15 +309,15 @@ int virt_to_phys_user(uintptr_t *paddr, pid_t pid, uintptr_t vaddr) {
 }
 
 void test_evict() {
-    void *test_base = ret_tramp;
-    void *ev_base = ret_tramp + (tramp_size >> 1);
+    void *test_base = tramp;
+    void *ev_base = tramp + (tramp_size >> 1);
     void *test_cursor = test_base + offset_dbg_probe;
     // load *test_cursor to L1i$
     CALL_ADDR(test_cursor);
     // let's try evicting *test_cursor
     // TODO: HANDLING CURSOR OVERFLOW
     for (void *ev_cursor = test_cursor + (tramp_size >> 1);
-         ev_cursor < ret_tramp + tramp_size;
+         ev_cursor < tramp + tramp_size;
          ev_cursor += (1 << cache_idx_bits)) {
         CALL_ADDR(ev_cursor);
     }
@@ -317,22 +325,68 @@ void test_evict() {
     printf("%llu\n", (unsigned long long)lat);
 }
 
+#define NR_CACHE_LOAD_REPT 4
 void test_evict2(void *test_cursor, void *ev_base, uint64_t ev_size, uint64_t nr_ev) {
     uint64_t nr_available_ev;
     void **evset = get_evset(test_cursor, ev_base, ev_size, cache_idx_bits, &nr_available_ev);
     assert(nr_available_ev>=nr_ev);
-    uint64_t *latency = malloc(nr_ev * sizeof(uint64_t));
 
+    test_cursor = evset[0]-(1<<cache_idx_bits);
+    uint64_t chain_evict[2] = {
+        (uint64_t)test_cursor,
+        (uint64_t)&probe_wrapper_tail
+    };
+
+    // deploy prime set
+    uint64_t snippet_size = &prime_snippet_end - &prime_snippet;
     for (int i = 0; i < nr_ev; i++) {
-        for (int j = 0; j < 8; j++) CALL_ADDR(evset[i]);
-        OPS_BARRIER(8);
+        memcpy((void*)evset[i], &prime_snippet, snippet_size);
+        __builtin___clear_cache((char *)evset[i], (char *)evset[i] + snippet_size);
     }
+    // deploy eviction set
+    memcpy((void*)test_cursor, &prime_snippet, snippet_size);
+    __builtin___clear_cache((char *)test_cursor, (char *)test_cursor + snippet_size);
 
-    if (do_eviction) {
-        test_cursor =evset[0]-(1<<cache_idx_bits);
-        // load *test_cursor to L1i$
+    uint64_t *iobuf = malloc(sizeof(uint64_t) * (cache_ways + 1));
+    for (int i=0; i<nr_ev; i++) {
+        iobuf[i] = (uint64_t)evset[nr_ev-i-1];
+    }
+    // last jump to the tail
+    iobuf[nr_ev] = (uint64_t)&probe_wrapper_tail;
+
+    uint64_t len_chain_prime = ((NR_CACHE_LOAD_REPT*nr_ev) + 1);
+    uint64_t *chain_prime = malloc(sizeof(uint64_t) * len_chain_prime);
+    for (int i=0; i<nr_ev; i++) {
+        for (int j=0; j<NR_CACHE_LOAD_REPT; j++){
+            chain_prime[i*NR_CACHE_LOAD_REPT+j] = iobuf[nr_ev-i-1];
+        }
+    }
+    chain_prime[(NR_CACHE_LOAD_REPT*nr_ev)] = (uint64_t)&probe_wrapper_tail;
+    uint64_t *iobuf_prime = malloc(sizeof(uint64_t) * len_chain_prime);
+    // prime the cache set
+    for (int _prime = 0; _prime < 32; _prime++)
+    {
+        for (uint64_t _copy=0; _copy<len_chain_prime; _copy++)
+            iobuf_prime[_copy] = chain_prime[_copy];
+        probe_wrapper_head(iobuf_prime);
+    }
+    OPS_BARRIER(8);
+
+    // if (do_eviction) {
+    //     uint64_t iobuf_evict[2];
+    //     for (int i = 0; i < 2; i++) {
+    //         iobuf_evict[0] = chain_evict[0];
+    //         iobuf_evict[1] = chain_evict[1];
+    //         probe_wrapper_head(iobuf_evict);
+    //     }
+    // }
+    {
+        uint64_t iobuf_evict[2];
         for (int i = 0; i < 2; i++) {
-            CALL_ADDR(test_cursor);
+            // If we want eviction, create a shortcut to the tail.
+            iobuf_evict[0] = do_eviction?chain_evict[0]:chain_evict[1];
+            iobuf_evict[1] = chain_evict[1];
+            probe_wrapper_head(iobuf_evict);
         }
     }
     OPS_BARRIER(8);
@@ -344,11 +398,7 @@ void test_evict2(void *test_cursor, void *ev_base, uint64_t ev_size, uint64_t nr
 #endif
 
     // let's detect who has been evicted by *test_cursor
-    for (register int i = nr_ev - 1; i >= 0; i--) {
-        OPS_BARRIER(8);
-        latency[i] = measure_br_latency((bool *)&do_br, evset[i]);
-    }
-
+    probe_wrapper_head(iobuf);
     assert(pid!=-1);
     {
         uintptr_t paddr;
@@ -358,16 +408,18 @@ void test_evict2(void *test_cursor, void *ev_base, uint64_t ev_size, uint64_t nr
     for (int i = 0; i < nr_ev; i++) {
         uintptr_t paddr;
         virt_to_phys_user(&paddr, pid, (uintptr_t)evset[i]);
-        printf("%d\tv=%p\tp=%p\tp_idx=%8x\t%"PRIu64"\n",
+        printf("%d\tv=%p\tp=%p\tp_idx=%6x\t%"PRIu64"\n",
                i,
                evset[i],
                (void*)paddr,
                ((paddr&((1<<cache_idx_bits)-1))>>cache_offset_bits),
-               latency[i]);
+               iobuf[i]);
     }
 
     free(evset);
-    free(latency);
+    free(iobuf_prime);
+    free(chain_prime);
+    free(iobuf);
 }
 
 void print_env() {
@@ -384,6 +436,8 @@ void print_env() {
 }
 
 void init(int argc, char **argv) {
+    // TODO: handle different cache line size
+    assert((&prime_snippet_end - &prime_snippet) == 64);
     argp_parse(&argp, argc, argv, 0, 0, NULL);
     assert(offset_dbg_probe<tramp_size);
     os_page_size = getpagesize();
@@ -393,15 +447,17 @@ void init(int argc, char **argv) {
 
 int main(int argc, char **argv) {
     init(argc, argv);
-    ret_tramp = create_ret_tramp(tramp_size, tramp_base);
-    assert(ret_tramp);
+    tramp = create_exec_tramp(tramp_size, tramp_base);
+    assert(tramp);
 
-    uint64_t cache_fast, cache_slow;
-    test_icache_latency(&cache_fast, &cache_slow);
-    printf("FAST:%"PRIu64" SLOW:%"PRIu64"\n", cache_fast, cache_slow);
+    // uint64_t cache_fast, cache_slow;
+    // test_icache_latency(&cache_fast, &cache_slow);
+    // printf("FAST:%"PRIu64" SLOW:%"PRIu64"\n", cache_fast, cache_slow);
 
-    test_evict2(ret_tramp + offset_dbg_probe,
-                ret_tramp + (tramp_size >> 1),
+    test_evict2(tramp + offset_dbg_probe,
+                tramp + (tramp_size >> 1),
                 tramp_size >> 1,
                 cache_ways);
+
+    munmap(tramp, tramp_size);
 }
