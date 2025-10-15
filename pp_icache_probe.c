@@ -76,7 +76,7 @@ static struct argp_option options[] = {
     {"evict", 'e', NULL, 0, "DEBUG: do eviction"},
     {0}};
 
-inline uint64_t read_cycles();
+static inline __attribute__((always_inline)) uint64_t read_cycles();
 
 static error_t parse_opt(int key, char *arg, struct argp_state *state) {
     switch (key) {
@@ -148,7 +148,7 @@ void fill_bhb(void) {
     }
 }
 
-uint64_t read_cycles() {
+static inline __attribute__((always_inline)) uint64_t read_cycles() {
 #if !defined(DBG_TIMER_HW)
 #define NANOSECONDS_PER_SECOND 1000000000L
     struct timespec tp;
@@ -176,9 +176,10 @@ uint64_t measure_br_latency(bool *br_cond, register void *target) {
     register uint64_t t = 0;
     // fill_bhb();
     if (*br_cond) {
-        OPS_BARRIER(8);
+        OPS_BARRIER(0);
         t = read_cycles();
         CALL_ADDR(target);
+        OPS_BARRIER(0);
         t = read_cycles() - t;
     }
     return t;
@@ -276,7 +277,7 @@ int pagemap_get_entry(PagemapEntry *entry, int pagemap_fd, uintptr_t vaddr) {
  *
  * @param[out] paddr physical address
  * @param[in]  pid   process to convert for
- * @param[in] vaddr virtual address to get entry for
+ * @param[in]  vaddr virtual address to get entry for
  * @return 0 for success, 1 for failure
  */
 int virt_to_phys_user(uintptr_t *paddr, pid_t pid, uintptr_t vaddr) {
