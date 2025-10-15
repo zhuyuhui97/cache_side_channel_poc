@@ -330,7 +330,6 @@ void test_evict2(void *test_cursor, void *ev_base, uint64_t ev_size,
                              &nr_available_ev);
     assert(nr_available_ev >= nr_ev);
 
-    test_cursor = evset[0] - (1 << cache_idx_bits);
     uint64_t chain_evict[2] = {(uint64_t)test_cursor,
                                (uint64_t)&probe_wrapper_tail};
 
@@ -370,7 +369,7 @@ void test_evict2(void *test_cursor, void *ev_base, uint64_t ev_size,
     }
     OPS_BARRIER(8);
 
-    {
+    {   // do evict on demand!
         uint64_t iobuf_evict[2];
         for (int i = 0; i < 2; i++) {
             // If we want eviction, create a shortcut to the tail.
@@ -442,8 +441,9 @@ int main(int argc, char **argv) {
     // test_icache_latency(&cache_fast, &cache_slow);
     // printf("FAST:%"PRIu64" SLOW:%"PRIu64"\n", cache_fast, cache_slow);
 
-    test_evict2(tramp + offset_dbg_probe, tramp + (tramp_size >> 1),
-                tramp_size >> 1, cache_ways);
+    void *ev_base = tramp + (tramp_size >> 1);
+    void *test_cursor = ev_base + offset_dbg_probe - (1 << cache_idx_bits);
+    test_evict2(test_cursor, ev_base, tramp_size >> 1, cache_ways);
 
     munmap(tramp, tramp_size);
 }
