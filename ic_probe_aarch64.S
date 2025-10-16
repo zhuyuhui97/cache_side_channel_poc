@@ -28,13 +28,13 @@ prime_snippet:
     dsb sy
     isb
     mrs RLOC_POST_CCNTR, pmccntr_el0
-    // load next addr
-    ldr RLOC_BR, [RPAR_DATA, RLOC_IDX, lsl #3]
     // store ccntr
     sub RLOC_POST_CCNTR, RLOC_POST_CCNTR, RLOC_PRE_CCNTR
     str RLOC_POST_CCNTR, [RPAR_DATA, RLOC_IDX, lsl #3]
     // inc index
     add RLOC_IDX, RLOC_IDX, 1
+    // load next addr
+    ldr RLOC_BR, [RPAR_DATA, RLOC_IDX, lsl #3]
     dsb sy
     isb
     nop

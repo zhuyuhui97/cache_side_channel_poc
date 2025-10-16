@@ -345,7 +345,7 @@ void test_evict2(void *test_cursor, void *ev_base, uint64_t ev_size,
     __builtin___clear_cache((char *)test_cursor,
                             (char *)test_cursor + snippet_size);
 
-    uint64_t *iobuf = malloc(sizeof(uint64_t) * (cache_ways + 1));
+    uint64_t *iobuf = malloc(sizeof(uint64_t) * (nr_ev + 1));
     for (int i = 0; i < nr_ev; i++) {
         iobuf[i] = (uint64_t)evset[nr_ev - i - 1];
     }
@@ -369,7 +369,7 @@ void test_evict2(void *test_cursor, void *ev_base, uint64_t ev_size,
     }
     OPS_BARRIER(8);
 
-    {   // do evict on demand!
+    { // do evict on demand!
         uint64_t iobuf_evict[2];
         for (int i = 0; i < 2; i++) {
             // If we want eviction, create a shortcut to the tail.
