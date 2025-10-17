@@ -82,19 +82,42 @@ typedef struct {
     walk_descriptor_t walk_probe;
 } pp_descriptors_t;
 
-uint64_t os_page_size;
+typedef struct {
+    void *p;
+    uint64_t size;
+} pagemap_t;
+
+typedef struct {
+    void *tramp_base;
+    uint64_t tramp_bits;
+    uint64_t tramp_size;
+    uint64_t cache_ways;
+    uint64_t cache_idx_bits;
+    uint64_t cache_offset_bits;
+    uint64_t offset_dbg_probe;
+    uint16_t pmu_event_id;
+    uint64_t threshold_ns;
+    bool do_eviction;
+} args_t;
+
+args_t args = {.tramp_base = NULL,
+               .tramp_bits = TRAMP_BITS_DEFAULT,
+               .tramp_size = (1 << TRAMP_BITS_DEFAULT),
+               .cache_ways = 16,
+               .cache_idx_bits = 20,
+               .cache_offset_bits = 6,
+               .offset_dbg_probe = OFFSET_PROBE_INPAGE,
+               .pmu_event_id = -1,
+               .threshold_ns = 0,
+               .do_eviction = false};
+
+uint64_t os_page_size = 0;
 uint64_t pid = -1;
-void *tramp_base = NULL;
-uint64_t tramp_bits = TRAMP_BITS_DEFAULT;
-uint64_t tramp_size = (1 << TRAMP_BITS_DEFAULT);
-uint64_t cache_ways = 16;
-uint64_t cache_idx_bits = 20;
-uint64_t cache_offset_bits = 6;
-uint64_t offset_dbg_probe = OFFSET_PROBE_INPAGE;
-uint16_t pmu_event_id = -1;
-uint64_t threshold_ns = 0;
-bool do_eviction = false;
-void *tramp;
+void *tramp = NULL;
+pagemap_t rw_buffer_shared = {
+    .p = NULL,
+    .size = 0,
+};
 
 extern uint8_t prime_snippet, prime_snippet_end;
 void walk_wrapper_head(uint64_t *buf);
@@ -109,7 +132,8 @@ static struct argp_option options[] = {
      "Bits of address span of the RET trampoline, size=(1<<TRAMPOLINE_BITS)."},
     {"probe", 'p', "OFFSET", 0, "DEBUG: test offset of P+P probe"},
     {"evict", 'e', NULL, 0, "DEBUG: do eviction"},
-    {"pmu-ev", 'm', "PMU_EVENT_ID", 0, "DEBUG: PMU event to monitor (ARM only)."},
+    {"pmu-ev", 'm', "PMU_EVENT_ID", 0,
+     "DEBUG: PMU event to monitor (ARM only)."},
     {"ns", 'n', "NANOSEC", 0, "Threshold in nanoseconds."},
     {0}};
 
@@ -118,36 +142,36 @@ static inline __attribute__((always_inline)) uint64_t read_cycles();
 static error_t parse_opt(int key, char *arg, struct argp_state *state) {
     switch (key) {
     case 't':
-        tramp_base = (void *)strtoull(arg, NULL, 0);
+        args.tramp_base = (void *)strtoull(arg, NULL, 0);
         break;
     case 'w':
-        cache_ways = strtoull(arg, NULL, 0);
+        args.cache_ways = strtoull(arg, NULL, 0);
         break;
     case 'b':
-        cache_idx_bits = strtoull(arg, NULL, 0);
-        if (cache_idx_bits < 6) {
+        args.cache_idx_bits = strtoull(arg, NULL, 0);
+        if (args.cache_idx_bits < 6) {
             fprintf(stderr, "error: cache_idx_bits must be >= 6\n");
             return ARGP_ERR_UNKNOWN;
         }
         break;
     case 'o':
-        cache_offset_bits = strtoull(arg, NULL, 0);
+        args.cache_offset_bits = strtoull(arg, NULL, 0);
         break;
     case 's':
-        tramp_bits = strtoull(arg, NULL, 0);
-        tramp_size = 1 << tramp_bits;
+        args.tramp_bits = strtoull(arg, NULL, 0);
+        args.tramp_size = 1 << args.tramp_bits;
         break;
     case 'p':
-        offset_dbg_probe = strtoull(arg, NULL, 0);
+        args.offset_dbg_probe = strtoull(arg, NULL, 0);
         break;
     case 'e':
-        do_eviction = true;
+        args.do_eviction = true;
         break;
     case 'm':
-        pmu_event_id = strtoull(arg, NULL, 0);
+        args.pmu_event_id = strtoull(arg, NULL, 0);
         break;
     case 'n':
-        threshold_ns = strtoull(arg, NULL, 0);
+        args.threshold_ns = strtoull(arg, NULL, 0);
         break;
     default:
         return ARGP_ERR_UNKNOWN;
@@ -181,7 +205,7 @@ void *create_ret_tramp(uint32_t size, void *base) {
 
 void fill_bhb(void) {
     void *_cursor = tramp + 0x9200;
-    uintptr_t end = (uintptr_t)tramp + tramp_size;
+    uintptr_t end = (uintptr_t)tramp + args.tramp_size;
     for (int i = 0; i < FILL_BHB_LEN; i++) {
         _cursor += (1 << NR_OPCODE_ALIGN);
         { // _cursor = (_cursor>=(ret_tramp+tramp_size)) ? ret_tramp : _cursor;
@@ -242,10 +266,13 @@ void train_bcond(void *valid_target) {
     }
 }
 
-void test_icache_latency(void* probe, void* tramp, uint64_t tramp_size, uint64_t *o_fast, uint64_t *o_slow) {
+void test_icache_latency(void *probe, void *tramp, uint64_t tramp_size,
+                         uint64_t *o_fast, uint64_t *o_slow) {
     // test branch latency when target in icache
-    probe = (void*)((uint64_t)probe & ~((1<<cache_offset_bits)-1)); // align to cache line
-    assert((probe<tramp) || (probe>=(tramp+tramp_size))); // not in the same region
+    probe = (void *)((uint64_t)probe & ~((1 << args.cache_offset_bits) -
+                                         1)); // align to cache line
+    assert((probe < tramp) ||
+           (probe >= (tramp + tramp_size))); // not in the same region
 
     printf("Test addr: %p\n", probe);
     fflush(stdout);
@@ -256,14 +283,14 @@ void test_icache_latency(void* probe, void* tramp, uint64_t tramp_size, uint64_t
     memcpy(probe, &prime_snippet, LEN_PRIME_SNIPPET);
     __builtin___clear_cache((char *)probe, (char *)probe + LEN_PRIME_SNIPPET);
     // make a jumping chain: head -> bridging snippet *->* probe snippet -> tail
-    uint64_t chain[3] = {(uint64_t)tramp,
-                        (uint64_t)tramp,
-                        (uint64_t)&walk_wrapper_tail};
+    uint64_t chain[3] = {(uint64_t)tramp, (uint64_t)tramp,
+                         (uint64_t)&walk_wrapper_tail};
     uint64_t iobuf[3];
 
     // test branch latency when target in icache
     for (int i = 0; i < 4; i++) {
-        for (int i = 0; i < 3; i++) iobuf[i] = chain[i];
+        for (int i = 0; i < 3; i++)
+            iobuf[i] = chain[i];
         OPS_BARRIER(8);
         walk_wrapper_head(iobuf);
         OPS_BARRIER(8);
@@ -273,7 +300,8 @@ void test_icache_latency(void* probe, void* tramp, uint64_t tramp_size, uint64_t
     // test branch latency when target not in icache
     // BUG: we change the chain here to avoid BPU-guided prefetch
     chain[1] = (uint64_t)probe;
-    for (int i = 0; i < 3; i++) iobuf[i] = chain[i];
+    for (int i = 0; i < 3; i++)
+        iobuf[i] = chain[i];
     FLUSH_ICACHE(probe);
     OPS_BARRIER(0x20);
     walk_wrapper_head(iobuf);
@@ -376,12 +404,14 @@ int virt_to_phys_user(uintptr_t *paddr, pid_t pid, uintptr_t vaddr) {
     return 0;
 }
 
-inline void init_probe_descriptor(uint64_t nr_ev, void **evset, walk_descriptor_t *o_walk_probe) {
+inline void init_probe_descriptor(uint64_t nr_ev, void **evset,
+                                  walk_descriptor_t *o_walk_probe) {
     uint64_t len = nr_ev + 1;
     // create probe chain
     uint64_t *chain_probe = malloc(sizeof(uint64_t) * len);
     uint64_t *iobuf_probe = malloc(sizeof(uint64_t) * len);
-    printf("iobuf_probe=%p - %p\n", iobuf_probe, (void *)((char *)iobuf_probe + len));
+    printf("iobuf_probe=%p - %p\n", iobuf_probe,
+           (void *)((char *)iobuf_probe + len));
     for (int i = 0; i < nr_ev; i++) {
         chain_probe[i] = (uint64_t)evset[nr_ev - i - 1];
     }
@@ -393,7 +423,9 @@ inline void init_probe_descriptor(uint64_t nr_ev, void **evset, walk_descriptor_
     o_walk_probe->len = len;
 }
 
-inline void init_prime_descriptor(uint64_t nr_rept, walk_descriptor_t *walk_probe, walk_descriptor_t *o_walk_prime) {
+inline void init_prime_descriptor(uint64_t nr_rept,
+                                  walk_descriptor_t *walk_probe,
+                                  walk_descriptor_t *o_walk_prime) {
     uint64_t *chain_probe = walk_probe->ro_chain;
     uint64_t nr_probe = (walk_probe->len) - 1; // exclude the tail
     uint64_t len_chain_prime = ((nr_rept * (nr_probe - 1)) + 1);
@@ -402,31 +434,35 @@ inline void init_prime_descriptor(uint64_t nr_rept, walk_descriptor_t *walk_prob
            nr_rept, nr_probe, len_chain_prime);
     uint64_t *chain_prime = malloc(sizeof(uint64_t) * len_chain_prime);
     uint64_t *iobuf_prime = malloc(sizeof(uint64_t) * len_chain_prime);
-    printf("iobuf_prime=%p - %p\n", iobuf_prime, (void *)((char *)iobuf_prime + len_chain_prime));
+    printf("iobuf_prime=%p - %p\n", iobuf_prime,
+           (void *)((char *)iobuf_prime + len_chain_prime));
     for (int i = 0; i < nr_rept; i++) {
         if (i % 2 == 0) {
             for (int j = 0; j < nr_probe - 1; j++)
-                chain_prime[i * (nr_probe - 1) + j] = chain_probe[nr_probe - j - 1];
+                chain_prime[i * (nr_probe - 1) + j] =
+                    chain_probe[nr_probe - j - 1];
         } else {
             for (int j = 0; j < nr_probe - 1; j++)
                 chain_prime[i * (nr_probe - 1) + j] = chain_probe[j];
         }
     }
-    chain_prime[len_chain_prime-1] = (uint64_t)&walk_wrapper_tail;
+    chain_prime[len_chain_prime - 1] = (uint64_t)&walk_wrapper_tail;
 
     o_walk_prime->ro_chain = chain_prime;
     o_walk_prime->rw_buffer = iobuf_prime;
     o_walk_prime->len = len_chain_prime;
 }
 
-inline void init_pp_descriptors(uint64_t nr_ev, void **evset, pp_descriptors_t *o_descriptor) {
+inline void init_pp_descriptors(uint64_t nr_ev, void **evset,
+                                pp_descriptors_t *o_descriptor) {
     uint64_t snippet_size = LEN_PRIME_SNIPPET;
     walk_descriptor_t *walk_probe = &(o_descriptor->walk_probe);
     walk_descriptor_t *walk_prime = &(o_descriptor->walk_prime);
     // copy prime snippet to all evset entries
     for (int i = 0; i < nr_ev; i++) {
         memcpy((void *)evset[i], &prime_snippet, LEN_PRIME_SNIPPET);
-        __builtin___clear_cache((char *)evset[i], (char *)evset[i] + LEN_PRIME_SNIPPET);
+        __builtin___clear_cache((char *)evset[i],
+                                (char *)evset[i] + LEN_PRIME_SNIPPET);
     }
     // initialize descriptors
     init_probe_descriptor(nr_ev, evset, walk_probe);
@@ -442,8 +478,10 @@ inline void walk_descriptor_t_copy_to_iobuf(walk_descriptor_t *desc) {
 }
 
 void walk_descriptor_t_free(walk_descriptor_t *desc) {
-    if (desc->ro_chain) free(desc->ro_chain);
-    if (desc->rw_buffer) free(desc->rw_buffer);
+    if (desc->ro_chain)
+        free(desc->ro_chain);
+    if (desc->rw_buffer)
+        free(desc->rw_buffer);
 }
 
 void pp_descriptors_t_free(pp_descriptors_t *desc) {
@@ -462,20 +500,20 @@ void print_res_test_primeprobe(uint64_t nr_ev, void *evict_line, void **evset,
     for (int i = 0; i < nr_ev; i++) {
         uintptr_t paddr;
         virt_to_phys_user(&paddr, pid, (uintptr_t)evset[i]);
-        uint p_idx = ((paddr & ((1 << cache_idx_bits) - 1)) >>
-                      cache_offset_bits);
+        uint p_idx = ((paddr & ((1 << args.cache_idx_bits) - 1)) >>
+                      args.cache_offset_bits);
         printf("%d\tv=%p\tp=%p\tp_idx=%6x\t%" PRIu64, i, evset[i],
                (void *)paddr, p_idx, rw_buffer_probe[i]);
-        printf((rw_buffer_probe[i] > threshold_ns) ? " *EVICTED*\n"
+        printf((rw_buffer_probe[i] > args.threshold_ns) ? " *EVICTED*\n"
                                                         : "\n");
     }
 }
 
 uint64_t test_primeprobe(void *evict_line, void *ev_base, uint64_t ev_size,
-                 uint64_t nr_ev) {
+                         uint64_t nr_ev) {
     uint64_t evict_cntr = 0;
     uint64_t nr_available_ev;
-    void **evset = get_evset(evict_line, ev_base, ev_size, cache_idx_bits,
+    void **evset = get_evset(evict_line, ev_base, ev_size, args.cache_idx_bits,
                              &nr_available_ev);
     assert(nr_available_ev >= nr_ev);
 
@@ -504,7 +542,7 @@ uint64_t test_primeprobe(void *evict_line, void *ev_base, uint64_t ev_size,
         uint64_t iobuf_evict[4];
         for (int i = 0; i < 128; i++) {
             // If we don't want eviction, create a shortcut to the tail.
-            iobuf_evict[0] = do_eviction ? chain_evict[0] : chain_evict[3];
+            iobuf_evict[0] = args.do_eviction ? chain_evict[0] : chain_evict[3];
             iobuf_evict[1] = chain_evict[1];
             iobuf_evict[2] = chain_evict[2];
             iobuf_evict[3] = chain_evict[3];
@@ -529,12 +567,12 @@ uint64_t test_primeprobe(void *evict_line, void *ev_base, uint64_t ev_size,
     walk_wrapper_head(rw_buffer_probe);
     OPS_BARRIER(8);
     for (int i = 0; i < nr_ev; i++) {
-        evict_cntr += (rw_buffer_probe[i] > threshold_ns);
+        evict_cntr += (rw_buffer_probe[i] > args.threshold_ns);
     }
     print_res_test_primeprobe(nr_ev, evict_line, evset, rw_buffer_probe);
 #if defined(__aarch64__)
-    if (pmu_event_id != (uint16_t)-1)
-        printf("PMU ev_0x%x=%d\n", pmu_event_id, rw_buffer_probe[nr_ev]);
+    if (args.pmu_event_id != (uint16_t)-1)
+        printf("PMU ev_0x%x=%d\n", args.pmu_event_id, rw_buffer_probe[nr_ev]);
 #endif
 
     free(evset);
@@ -547,49 +585,60 @@ void print_env() {
     printf("PID: %" PRIu64 "\n", pid);
     printf("Page size: %" PRIu64 "\n", os_page_size);
     printf("=== USER VALUES ===\n");
-    printf("Cache ways: %" PRIu64 "\n", cache_ways);
-    printf("Cache index bits: %" PRIu64 " (cover %llu bytes)\n", cache_idx_bits,
-           (1ULL << cache_idx_bits));
-    printf("Cache offset bits: %" PRIu64 "\n", cache_offset_bits);
-    printf("Trampoline size: %" PRIu64 " bytes\n", tramp_size);
+    printf("Cache ways: %" PRIu64 "\n", args.cache_ways);
+    printf("Cache index bits: %" PRIu64 " (cover %llu bytes)\n",
+           args.cache_idx_bits, (1ULL << args.cache_idx_bits));
+    printf("Cache offset bits: %" PRIu64 "\n", args.cache_offset_bits);
+    printf("Trampoline size: %" PRIu64 " bytes\n", args.tramp_size);
     printf("\n");
+}
+
+void init_rw_buffer_shared() {
+    uint64_t size = (2 << args.cache_idx_bits);
+    void *buf = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    assert(buf != MAP_FAILED);
+    rw_buffer_shared.p = buf;
+    rw_buffer_shared.size = size;
 }
 
 void init(int argc, char **argv) {
     // TODO: handle different cache line size
     assert(LEN_PRIME_SNIPPET == 64);
     argp_parse(&argp, argc, argv, 0, 0, NULL);
-    assert(offset_dbg_probe < tramp_size);
+    assert(args.offset_dbg_probe < args.tramp_size);
     os_page_size = getpagesize();
     pid = getpid();
+    init_rw_buffer_shared();
     print_env();
 }
 
 int main(int argc, char **argv) {
     init(argc, argv);
-    tramp = create_exec_tramp(tramp_size, tramp_base);
+    tramp = create_exec_tramp(args.tramp_size, args.tramp_base);
     assert(tramp);
 #if defined(__aarch64__)
-    if (pmu_event_id != (uint16_t)-1)
-        INIT_PMU(0, pmu_event_id);
+    if (args.pmu_event_id != (uint16_t)-1)
+        INIT_PMU(0, args.pmu_event_id);
 #endif
 
-    void *ev_base = tramp + (tramp_size >> 1);
+    void *ev_base = tramp + (args.tramp_size >> 1);
     // TODO: remove magic number
-    void *test_cursor = ev_base +
-                        (offset_dbg_probe & ((1 << cache_idx_bits) - 1)) -
-                        (12 << cache_idx_bits);
-    if (threshold_ns == 0) { // calibrate threshold
+    void *test_cursor =
+        ev_base + (args.offset_dbg_probe & ((1 << args.cache_idx_bits) - 1)) -
+        (12 << args.cache_idx_bits);
+    if (args.threshold_ns == 0) { // calibrate threshold
         uint64_t cache_fast, cache_slow;
-        test_icache_latency(tramp + 0x6c0, ev_base, tramp_size >> 1,
+        test_icache_latency(tramp + 0x6c0, ev_base, args.tramp_size >> 1,
                             &cache_fast, &cache_slow);
-        threshold_ns = (cache_fast + cache_slow) / 2;
+        args.threshold_ns = (cache_fast + cache_slow) / 2;
         printf("FAST:%" PRIu64 " SLOW:%" PRIu64 " THRESHOLD:%" PRIu64 "\n",
-               cache_fast, cache_slow, threshold_ns);
+               cache_fast, cache_slow, args.threshold_ns);
     } else {
-        printf("THRESHOLD:%" PRIu64 "\n", threshold_ns);
+        printf("THRESHOLD:%" PRIu64 "\n", args.threshold_ns);
     }
-    test_primeprobe(test_cursor, ev_base, tramp_size >> 1, cache_ways);
+    test_primeprobe(test_cursor, ev_base, args.tramp_size >> 1,
+                    args.cache_ways);
 
-    munmap(tramp, tramp_size);
+    munmap(tramp, args.tramp_size);
 }
