@@ -412,7 +412,7 @@ inline void init_prime_descriptor(uint64_t nr_rept, walk_descriptor_t *walk_prob
                 chain_prime[i * (nr_probe - 1) + j] = chain_probe[j];
         }
     }
-    chain_prime[(nr_rept * (nr_probe - 1))] = (uint64_t)&walk_wrapper_tail;
+    chain_prime[len_chain_prime-1] = (uint64_t)&walk_wrapper_tail;
 
     o_walk_prime->ro_chain = chain_prime;
     o_walk_prime->rw_buffer = iobuf_prime;
