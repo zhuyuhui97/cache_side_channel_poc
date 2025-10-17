@@ -6,8 +6,8 @@
 #define RLOC_PRE_EVCNTR  x13
 #define RLOC_POST_L2REF x14
 
-.global probe_wrapper_head
-probe_wrapper_head:
+.global walk_wrapper_head
+walk_wrapper_head:
     eor RLOC_IDX, RLOC_IDX, RLOC_IDX
     ldr RLOC_BR, [RPAR_DATA, RLOC_IDX, lsl #3]
     dsb sy
@@ -19,14 +19,14 @@ probe_wrapper_head:
     mrs RLOC_PRE_EVCNTR, pmevcntr0_el0
     mrs RLOC_PRE_CCNTR, pmccntr_el0
     br RLOC_BR
-.global probe_wrapper_tail
-probe_wrapper_tail:
+.global walk_wrapper_tail
+walk_wrapper_tail:
     mrs RLOC_POST_L2REF, pmevcntr0_el0
     sub RLOC_POST_L2REF, RLOC_POST_L2REF, RLOC_PRE_EVCNTR
     str RLOC_POST_L2REF, [RPAR_DATA, RLOC_IDX, lsl #3]
     ret
-.global probe_wrapper_end
-probe_wrapper_end:
+.global walk_wrapper_end
+walk_wrapper_end:
 
 .align 6
 .global prime_snippet
