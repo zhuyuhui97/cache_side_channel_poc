@@ -520,12 +520,12 @@ void test_primeprobe(void *evict_line, void *ev_base, uint64_t ev_size,
         printf("%d\tv=%p\tp=%p\tp_idx=%6x\t%" PRIu64, i, evset[i],
                (void *)paddr,
                p_idx,
-               rw_buffer_prime[i]);
-        printf((rw_buffer_prime[i] > threshold_ns) ? " *EVICTED*\n" : "\n");
+               rw_buffer_probe[i]);
+        printf((rw_buffer_probe[i] > threshold_ns) ? " *EVICTED*\n" : "\n");
     }
 #if defined(__aarch64__)
     if (pmu_event_id != (uint16_t)-1)
-        printf("PMU ev_0x%x=%d\n", pmu_event_id, rw_buffer_prime[nr_ev]);
+        printf("PMU ev_0x%x=%d\n", pmu_event_id, rw_buffer_probe[nr_ev]);
 #endif
 
     free(evset);
