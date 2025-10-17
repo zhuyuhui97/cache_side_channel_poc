@@ -451,8 +451,29 @@ void pp_descriptors_t_free(pp_descriptors_t *desc) {
     walk_descriptor_t_free(&(desc->walk_probe));
 }
 
-void test_primeprobe(void *evict_line, void *ev_base, uint64_t ev_size,
+void print_res_test_primeprobe(uint64_t nr_ev, void *evict_line, void **evset,
+                               uint64_t *rw_buffer_probe) {
+    assert(pid != -1);
+    {
+        uintptr_t paddr;
+        virt_to_phys_user(&paddr, pid, (uintptr_t)evict_line);
+        printf("!\tv=%p\tp=%p\n", evict_line, (void *)paddr);
+    }
+    for (int i = 0; i < nr_ev; i++) {
+        uintptr_t paddr;
+        virt_to_phys_user(&paddr, pid, (uintptr_t)evset[i]);
+        uint p_idx = ((paddr & ((1 << cache_idx_bits) - 1)) >>
+                      cache_offset_bits);
+        printf("%d\tv=%p\tp=%p\tp_idx=%6x\t%" PRIu64, i, evset[i],
+               (void *)paddr, p_idx, rw_buffer_probe[i]);
+        printf((rw_buffer_probe[i] > threshold_ns) ? " *EVICTED*\n"
+                                                        : "\n");
+    }
+}
+
+uint64_t test_primeprobe(void *evict_line, void *ev_base, uint64_t ev_size,
                  uint64_t nr_ev) {
+    uint64_t evict_cntr = 0;
     uint64_t nr_available_ev;
     void **evset = get_evset(evict_line, ev_base, ev_size, cache_idx_bits,
                              &nr_available_ev);
@@ -507,22 +528,10 @@ void test_primeprobe(void *evict_line, void *ev_base, uint64_t ev_size,
     OPS_BARRIER(8);
     walk_wrapper_head(rw_buffer_probe);
     OPS_BARRIER(8);
-    assert(pid != -1);
-    {
-        uintptr_t paddr;
-        virt_to_phys_user(&paddr, pid, (uintptr_t)evict_line);
-        printf("!\tv=%p\tp=%p\n", evict_line, (void *)paddr);
-    }
     for (int i = 0; i < nr_ev; i++) {
-        uintptr_t paddr;
-        virt_to_phys_user(&paddr, pid, (uintptr_t)evset[i]);
-        uint p_idx = ((paddr & ((1 << cache_idx_bits) - 1)) >> cache_offset_bits);
-        printf("%d\tv=%p\tp=%p\tp_idx=%6x\t%" PRIu64, i, evset[i],
-               (void *)paddr,
-               p_idx,
-               rw_buffer_probe[i]);
-        printf((rw_buffer_probe[i] > threshold_ns) ? " *EVICTED*\n" : "\n");
+        evict_cntr += (rw_buffer_probe[i] > threshold_ns);
     }
+    print_res_test_primeprobe(nr_ev, evict_line, evset, rw_buffer_probe);
 #if defined(__aarch64__)
     if (pmu_event_id != (uint16_t)-1)
         printf("PMU ev_0x%x=%d\n", pmu_event_id, rw_buffer_probe[nr_ev]);
@@ -530,6 +539,7 @@ void test_primeprobe(void *evict_line, void *ev_base, uint64_t ev_size,
 
     free(evset);
     pp_descriptors_t_free(&pp_desc);
+    return evict_cntr;
 }
 
 void print_env() {
