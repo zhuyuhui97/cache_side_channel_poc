@@ -101,7 +101,11 @@ typedef struct {
 } args_t;
 
 typedef struct {
-    uint64_t ev_ptr;
+    uint64_t ev;
+    uint64_t prime_rounds;
+    uint64_t prime_rounds_repeats;
+    uint64_t evict_repeats;
+
 } ctx_t;
 
 args_t args = {.tramp_base = NULL,
@@ -117,8 +121,11 @@ args_t args = {.tramp_base = NULL,
 
 uint64_t os_page_size = 0;
 uint64_t pid = -1;
-void *tramp = NULL;
 pagemap_t rw_buffer_shared = {
+    .p = NULL,
+    .size = 0,
+};
+pagemap_t pmap_tramp = {
     .p = NULL,
     .size = 0,
 };
@@ -199,8 +206,15 @@ void *create_exec_tramp(uint32_t size, void *base) {
     return buf;
 }
 
-void test_icache_latency(void *probe, void *tramp, uint64_t tramp_size,
-                         uint64_t *o_fast, uint64_t *o_slow) {
+void pagemap_t_free(pagemap_t *pmap) {
+    if (pmap->p)
+        munmap(pmap->p, pmap->size);
+}
+
+void test_icache_latency(void *probe, pagemap_t pmap, uint64_t *o_fast,
+                         uint64_t *o_slow) {
+    void *tramp = pmap.p;
+    uint64_t tramp_size = pmap.size;
     // test branch latency when target in icache
     probe = (void *)((uint64_t)probe & ~((1 << args.cache_offset_bits) -
                                          1)); // align to cache line
@@ -246,18 +260,20 @@ void test_icache_latency(void *probe, void *tramp, uint64_t tramp_size,
     __builtin___clear_cache((char *)probe, (char *)probe + LEN_PRIME_SNIPPET);
 }
 
-void **get_prime_set(void *i_target, void *i_base, uint64_t i_len,
-                 uint64_t i_addr_bits, uint64_t *o_n) {
-    uint64_t stride = 1 << i_addr_bits;
+void **get_prime_set(void *i_target, pagemap_t pmap, uint64_t *o_n) {
+    void *pr_base = pmap.p;
+    uint64_t pr_len = pmap.size;
+    uint64_t idx_bits = args.cache_idx_bits;
+    uint64_t stride = 1 << idx_bits;
     uint64_t mask = stride - 1;
     uint64_t index = (uint64_t)i_target & mask;
     uint64_t base_unaligned =
-        -(((uint64_t)i_base & mask) != 0); // -1 when unaligned
+        -(((uint64_t)pr_base & mask) != 0); // -1 when unaligned
     uint64_t cursor =
-        (((uint64_t)i_base & ~mask) | index) + (base_unaligned & stride);
-    uint64_t end = (uint64_t)i_base + i_len;
+        (((uint64_t)pr_base & ~mask) | index) + (base_unaligned & stride);
+    uint64_t end = (uint64_t)pr_base + pr_len;
     assert(((uint64_t)i_target < cursor) || (uint64_t)i_target > end);
-    uint64_t n = (1 & base_unaligned) + ((end - cursor) >> i_addr_bits);
+    uint64_t n = (1 & base_unaligned) + ((end - cursor) >> idx_bits);
     *o_n = n;
     void **o_evset = malloc(n * sizeof(void *));
     for (int i = 0; i < n; i++) {
@@ -444,12 +460,13 @@ void print_res_test_primeprobe(void *evict_line, void **evset,
     }
 }
 
-uint64_t test_primeprobe(void *ev, void *pr_base, uint64_t pr_size) {
+uint64_t test_primeprobe(void *ev, pagemap_t pr) {
+    void *pr_base = pr.p;
+    uint64_t pr_size = pr.size;
     uint64_t nr_prime = args.cache_ways;
     uint64_t evict_cntr = 0;
     uint64_t nr_available_ev;
-    void **evset =
-        get_prime_set(ev, pr_base, pr_size, args.cache_idx_bits, &nr_available_ev);
+    void **evset = get_prime_set(ev, pr, &nr_available_ev);
     assert(nr_available_ev >= nr_prime);
 
     uint64_t chain_evict[4] = {(uint64_t)ev, (uint64_t)ev, (uint64_t)ev,
@@ -527,6 +544,13 @@ void print_env() {
     printf("\n");
 }
 
+void init_shared_tramp() {
+    void *tramp = create_exec_tramp(args.tramp_size, args.tramp_base);
+    assert(tramp);
+    pmap_tramp.p = tramp;
+    pmap_tramp.size = args.tramp_size;
+}
+
 void init_rw_buffer_shared() {
     uint64_t size = (2 << args.cache_idx_bits);
     void *buf = mmap(NULL, size, PROT_READ | PROT_WRITE,
@@ -543,36 +567,40 @@ void init(int argc, char **argv) {
     assert(args.offset_dbg_probe < args.tramp_size);
     os_page_size = getpagesize();
     pid = getpid();
+    init_shared_tramp();
     init_rw_buffer_shared();
     print_env();
-}
-
-int main(int argc, char **argv) {
-    init(argc, argv);
-    tramp = create_exec_tramp(args.tramp_size, args.tramp_base);
-    assert(tramp);
 #if defined(__aarch64__)
     if (args.pmu_event_id != (uint16_t)-1)
         INIT_PMU(0, args.pmu_event_id);
 #endif
+}
 
-    void *pr_base = tramp + (args.tramp_size >> 1);
+int main(int argc, char **argv) {
+    init(argc, argv);
+
+    void *pr_base = pmap_tramp.p + (args.tramp_size >> 1);
+    pagemap_t pmap_pr = {
+        .p = pr_base,
+        .size = args.tramp_size >> 1,
+    };
+
     // TODO: remove magic number
     void *test_cursor =
-        pr_base +
-        (args.offset_dbg_probe & ((1 << args.cache_idx_bits) - 1)) -
+        pr_base + (args.offset_dbg_probe & ((1 << args.cache_idx_bits) - 1)) -
         (12 << args.cache_idx_bits);
     if (args.threshold_ns == 0) { // calibrate threshold
         uint64_t cache_fast, cache_slow;
-        test_icache_latency(tramp + 0x6c0, pr_base, args.tramp_size >> 1,
-                            &cache_fast, &cache_slow);
+        test_icache_latency(pmap_tramp.p + 0x6c0, pmap_pr, &cache_fast,
+                            &cache_slow);
         args.threshold_ns = (cache_fast + cache_slow) / 2;
         printf("FAST:%" PRIu64 " SLOW:%" PRIu64 " THRESHOLD:%" PRIu64 "\n",
                cache_fast, cache_slow, args.threshold_ns);
     } else {
         printf("THRESHOLD:%" PRIu64 "\n", args.threshold_ns);
     }
-    test_primeprobe(test_cursor, pr_base, args.tramp_size >> 1);
 
-    munmap(tramp, args.tramp_size);
+    test_primeprobe(test_cursor, pmap_pr);
+
+    pagemap_t_free(&pmap_tramp);
 }
