@@ -1,5 +1,6 @@
 // #include <stdint.h>
 #include <linux/init.h>
+#include <linux/cpu.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/types.h>
@@ -18,56 +19,80 @@ MODULE_LICENSE("GPL");
 #define FOREACH_PMUREG(D)                                                      \
     D(PMUSERENR_EL0)                                                           \
     D(PMCNTENSET_EL0)                                                          \
-    D(PMCR_EL0)
-#define DEFINE_SYSREG_VARS(name) u64 val_##name = 0, bak_##name = 0;
-FOREACH_PMUREG(DEFINE_SYSREG_VARS);
-#undef DEFINE_SYSREG_VARS
-#undef DEFINE_SYSREG_VARS
+    D(PMCR_EL0)                                                                \
+    D(S3_1_c15_c2_0) /* CPUACTLR_EL1 */                                        \
+    D(S3_1_c15_c2_1) /* CPUECTLR_EL1 */                                        \
+    D(S3_1_c15_c0_0) /* L2ACTLR_EL1 */
 
-static void get_regs(void) {
+typedef struct {
+#define DEFINE_SYSREG_VARS(name) u64 val_##name; u64 bak_##name;
+FOREACH_PMUREG(DEFINE_SYSREG_VARS)
+#undef DEFINE_SYSREG_VARS
+} sys_reg_per_cpu;
+
+static sys_reg_per_cpu cpu_reg[128];
+
+static void get_regs(int cpu) {
 #define GET_ALL_SYSREGS(name)                                                  \
-    asm volatile("MRS %0, " #name : "=r"(bak_##name));                         \
-    val_##name = bak_##name;
+    asm volatile("MRS %0, " #name : "=r"(cpu_reg[cpu].bak_##name));                         \
+    cpu_reg[cpu].val_##name = cpu_reg[cpu].bak_##name;
 
     FOREACH_PMUREG(GET_ALL_SYSREGS);
 #undef GET_ALL_SYSREGS
 }
 
-static void commit_regs(void) {
+static void commit_regs(int cpu) {
 #define COMMIT_ALL_SYSREGS(name)                                               \
-    asm volatile("MSR " #name ", %0" ::"r"(val_##name));
+    asm volatile("MSR " #name ", %0" ::"r"(cpu_reg[cpu].val_##name));
     FOREACH_PMUREG(COMMIT_ALL_SYSREGS);
 #undef COMMIT_ALL_SYSREGS
 }
 
-static void restore_regs(void) {
-#define RESTORE_ALL_SYSREGS(name) val_##name = bak_##name;
+static void restore_regs(int cpu) {
+#define RESTORE_ALL_SYSREGS(name) cpu_reg[cpu].val_##name = cpu_reg[cpu].bak_##name;
     FOREACH_PMUREG(RESTORE_ALL_SYSREGS);
 #undef RESTORE_ALL_SYSREGS
-    commit_regs();
+    commit_regs(cpu);
 }
 
 // Enable EL0 read/write access to PMU registers
-static void enable_el0_access(void) { val_PMUSERENR_EL0 |= PMUSERENR_ENABLE; }
+static void enable_el0_access(int cpu) { cpu_reg[cpu].val_PMUSERENR_EL0 |= PMUSERENR_ENABLE; }
 
 //
-static void enable_evcntrs(void) {
-    val_PMCR_EL0 |= PMCR_E;
-    val_PMCR_EL0 |= PMCR_P;
-    val_PMCR_EL0 |= PMCR_C;
-    val_PMCR_EL0 &= ~PMCR_D;
-    val_PMCR_EL0 |= ~PMCR_X;
+static void enable_evcntrs(int cpu) {
+    cpu_reg[cpu].val_PMCR_EL0 |= PMCR_E;
+    cpu_reg[cpu].val_PMCR_EL0 |= PMCR_P;
+    cpu_reg[cpu].val_PMCR_EL0 |= PMCR_C;
+    cpu_reg[cpu].val_PMCR_EL0 &= ~PMCR_D;
+    cpu_reg[cpu].val_PMCR_EL0 |= ~PMCR_X;
 }
 
 // Enable the cycle counter register.
-static void enable_ccntr(void) { val_PMCNTENSET_EL0 |= (1 << 31); }
+static void enable_ccntr(int cpu) { cpu_reg[cpu].val_PMCNTENSET_EL0 |= (1 << 31); }
+
+static void set_classic_lru(int cpu) {
+    cpu_reg[cpu].val_S3_1_c15_c0_0 &= ~(3ULL << 30);
+    cpu_reg[cpu].val_S3_1_c15_c0_0 |= (1ULL << 30);
+}
+
+static void disable_prefetch(int cpu) {
+    cpu_reg[cpu].val_S3_1_c15_c2_0 |= (1ULL << 56);
+    cpu_reg[cpu].val_S3_1_c15_c2_0 |= (1ULL << 43);
+    cpu_reg[cpu].val_S3_1_c15_c2_0 |= (1ULL << 42);
+    cpu_reg[cpu].val_S3_1_c15_c2_0 |= (1ULL << 32);
+    cpu_reg[cpu].val_S3_1_c15_c2_1 &= ~(3ULL << 35); // CPUECTLR_EL1[36:35] = 0b11
+}
 
 static void enable(void) {
-    get_regs();
-    enable_el0_access();
-    enable_evcntrs();
-    enable_ccntr();
-    commit_regs();
+    int cpu = smp_processor_id();
+    printk(KERN_INFO "PMU-ARM: enabling PMU on CPU %d\n", cpu);
+    get_regs(cpu);
+    enable_el0_access(cpu);
+    enable_evcntrs(cpu);
+    enable_ccntr(cpu);
+    // disable_prefetch(cpu);
+    commit_regs(cpu);
+    printk(KERN_INFO "PMU-ARM: finished on CPU %d\n", cpu);
 }
 
 static int __init mod_start(void) {
