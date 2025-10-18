@@ -34,6 +34,10 @@
 
 #define LEN_PRIME_SNIPPET (&prime_snippet_end - &prime_snippet)
 
+#define SIZE_PRIME_GAP (1 << args.cache_idx_bits)
+#define SIZE_CACHE_LINE (1 << args.cache_offset_bits)
+#define CACHE_LINE_ALIGN(addr) ((void*)((uint64_t)addr &~(SIZE_CACHE_LINE-1)))
+
 /* uarch-dependent definitions */
 #if defined(__x86_64__)
 #define OPS_BARRIER(x)                                                         \
@@ -98,12 +102,12 @@ typedef struct {
     uint16_t pmu_event_id;
     uint64_t threshold_ns;
     bool do_eviction;
+    bool verbose;
 } args_t;
 
 typedef struct {
     void **list;
     uint64_t available;
-    uint64_t size;
 } prime_set_t;
 
 typedef struct {
@@ -124,7 +128,9 @@ args_t args = {.tramp_base = NULL,
                .offset_dbg_probe = OFFSET_PROBE_INPAGE,
                .pmu_event_id = -1,
                .threshold_ns = 0,
-               .do_eviction = false};
+               .do_eviction = false,
+               .verbose=false
+            };
 
 uint64_t os_page_size = 0;
 uint64_t pid = -1;
@@ -159,6 +165,7 @@ static struct argp_option options[] = {
     {"pmu-ev", 'm', "PMU_EVENT_ID", 0,
      "DEBUG: PMU event to monitor (ARM only)."},
     {"ns", 'n', "NANOSEC", 0, "Threshold in nanoseconds."},
+    {"verbose", 'v', NULL, 0, "Print debug information."},
     {0}};
 
 static inline __attribute__((always_inline)) uint64_t read_cycles();
@@ -196,6 +203,9 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
         break;
     case 'n':
         args.threshold_ns = strtoull(arg, NULL, 0);
+        break;
+    case 'v':
+        args.verbose = true;
         break;
     default:
         return ARGP_ERR_UNKNOWN;
@@ -273,7 +283,9 @@ void test_icache_latency(void *probe, pagemap_t pmap, uint64_t *o_fast,
     __builtin___clear_cache((char *)probe, (char *)probe + LEN_PRIME_SNIPPET);
 }
 
-void **get_prime_set(void *i_target, pagemap_t pmap, uint64_t *o_n) {
+void get_prime_set(pagemap_t pmap, ctx_t *ctx) {
+    void *i_target = ctx->ev;
+    uint64_t *o_n;
     void *pr_base = pmap.p;
     uint64_t pr_len = pmap.size;
     uint64_t idx_bits = args.cache_idx_bits;
@@ -287,14 +299,29 @@ void **get_prime_set(void *i_target, pagemap_t pmap, uint64_t *o_n) {
     uint64_t end = (uint64_t)pr_base + pr_len;
     assert(((uint64_t)i_target < cursor) || (uint64_t)i_target > end);
     uint64_t n = (1 & base_unaligned) + ((end - cursor) >> idx_bits);
-    *o_n = n;
     void **o_evset = malloc(n * sizeof(void *));
     for (int i = 0; i < n; i++) {
         assert(cursor < end);
         o_evset[i] = (void *)cursor;
         cursor += stride;
     }
-    return o_evset;
+    ctx->prime_set = malloc(sizeof(prime_set_t));
+    ctx->prime_set->list = o_evset;
+    ctx->prime_set->available = n;
+}
+
+inline void prime_set_t_free(prime_set_t *pr_set) {
+    if (pr_set->list){
+        free(pr_set->list);
+        pr_set->list = NULL;
+    }
+}
+inline void ctx_t_free_prime_set(ctx_t *ctx) {
+    if (ctx->prime_set) {
+        prime_set_t_free(ctx->prime_set);
+        free(ctx->prime_set);
+        ctx->prime_set = NULL;
+    }
 }
 
 typedef struct {
@@ -366,15 +393,66 @@ int virt_to_phys_user(uintptr_t *paddr, pid_t pid, uintptr_t vaddr) {
     return 0;
 }
 
-inline void init_probe_descriptor(void **evset,
-                                  walk_descriptor_t *o_walk_probe, ctx_t ctx) {
+void *get_rw_buffer_in_tramp(uint64_t size, pagemap_t tramp, ctx_t ctx) {
+    // TODO: an additinal margin to prevent consecutive line prefetching
+    uint64_t prefetch_margin = 0;
+    uint64_t allowed_size = (SIZE_PRIME_GAP - SIZE_CACHE_LINE);
+    if (size >= (args.tramp_size - SIZE_CACHE_LINE))
+    {
+        fprintf(stderr, "E: RW buffer bigger than trampoline! Requested %" PRIu64 "\n", size);
+        exit(-1);
+    }
+    if (size >= allowed_size)
+    { // WARNING: requested buffer is larger than a gap between prime lines!
+        fprintf(stderr, "W: RW buffer oversized. Allow %" PRIu64 ", requested %" PRIu64 "\n", allowed_size, size);
+    }
+
+    void **prset = ctx.prime_set->list;
+    uint64_t nr_prime = args.cache_ways;
+    void *min = (void*)-1ULL, *max = NULL;
+    for (uint64_t i=0; i<nr_prime; i++) {
+        if (prset[i] > max) max = prset[i];
+        if (prset[i] < min) min = prset[i];
+    }
+    min = (CACHE_LINE_ALIGN(min) - prefetch_margin);
+    max = (CACHE_LINE_ALIGN(max) + SIZE_CACHE_LINE + prefetch_margin);
+    uint64_t min_margin = min - tramp.p ;
+    uint64_t max_margin = (tramp.p + tramp.size) - max;
+
+
+    uint64_t scan_grow = 0;
+    void* scan_start = NULL;
+    if (max_margin >= size)
+    {
+        scan_grow = 0;
+        scan_start = max;
+    }
+    else if (min_margin >= size) {
+        scan_grow = -1;
+        scan_start = min;
+    }
+    else {
+        if (size >= allowed_size) {
+            fprintf(stderr, "E: No enough spaces between prime lines!\n");
+            exit(-1);
+        }
+        scan_grow = 0;
+        scan_start = prset[0];
+    }
+
+    void* o = CACHE_LINE_ALIGN(scan_start + scan_grow * size);
+    return o;
+}
+
+inline void init_probe_descriptor(void **evset, walk_descriptor_t *o_walk_probe,
+                                  ctx_t ctx) {
     uint64_t nr_prime = args.cache_ways;
     uint64_t len = nr_prime + 1;
     // create probe chain
     uint64_t *chain_probe = malloc(sizeof(uint64_t) * len);
-    uint64_t *iobuf_probe = malloc(sizeof(uint64_t) * len);
+    uint64_t *iobuf_probe = get_rw_buffer_in_tramp(sizeof(uint64_t)*len, pmap_tramp, ctx);
     // printf("iobuf_probe=%p - %p\n", iobuf_probe,
-        //    (void *)((char *)iobuf_probe + len));
+    //    (void *)((char *)iobuf_probe + len));
     for (int i = 0; i < nr_prime; i++) {
         chain_probe[i] = (uint64_t)evset[nr_prime - i - 1];
     }
@@ -384,23 +462,20 @@ inline void init_probe_descriptor(void **evset,
     o_walk_probe->ro_chain = chain_probe;
     o_walk_probe->rw_buffer = iobuf_probe;
     o_walk_probe->len = len;
+    // for (uint64_t i=0; i<len; i++)
+    //     printf("probe[%"PRIu64"]=%p\n", i, (void*)chain_probe[i]);
 }
 
 inline void init_prime_descriptor(walk_descriptor_t *walk_probe,
-                                  walk_descriptor_t *o_walk_prime,
-                                  ctx_t ctx) {
+                                  walk_descriptor_t *o_walk_prime, ctx_t ctx) {
     // walk the prime set back and forth
     uint64_t nr_rept = ctx.prime_rounds;
     uint64_t *chain_probe = walk_probe->ro_chain;
     uint64_t nr_probe = (walk_probe->len) - 1; // exclude the tail
     uint64_t len_chain_prime = ((nr_rept * (nr_probe - 1)) + 1);
-    // printf("Prime descriptor: nr_rept=%" PRIu64 ", nr_probe=%" PRIu64
-        //    ", len_chain_prime=%" PRIu64 "\n",
-        //    nr_rept, nr_probe, len_chain_prime);
     uint64_t *chain_prime = malloc(sizeof(uint64_t) * len_chain_prime);
-    uint64_t *iobuf_prime = malloc(sizeof(uint64_t) * len_chain_prime);
-    // printf("iobuf_prime=%p - %p\n", iobuf_prime,
-        //    (void *)((char *)iobuf_prime + len_chain_prime));
+    uint64_t *iobuf_prime = get_rw_buffer_in_tramp(sizeof(uint64_t)*len_chain_prime, pmap_tramp, ctx);
+    // printf("iobuf_prime=%p \n", iobuf_prime);
     for (int i = 0; i < nr_rept; i++) {
         if (i % 2 == 0) {
             for (int j = 0; j < nr_probe - 1; j++)
@@ -416,9 +491,12 @@ inline void init_prime_descriptor(walk_descriptor_t *walk_probe,
     o_walk_prime->ro_chain = chain_prime;
     o_walk_prime->rw_buffer = iobuf_prime;
     o_walk_prime->len = len_chain_prime;
+    // for (uint64_t i=0; i<len_chain_prime; i++)
+    //     printf("prime[%"PRIu64"]=%p\n", i, (void*)chain_prime[i]);
 }
 
-inline void init_pp_descriptors(void **evset, pp_descriptors_t *o_descriptor, ctx_t ctx) {
+inline void init_pp_descriptors(void **evset, pp_descriptors_t *o_descriptor,
+                                ctx_t ctx) {
     uint64_t nr_prime = args.cache_ways;
     uint64_t snippet_size = LEN_PRIME_SNIPPET;
     walk_descriptor_t *walk_probe = &(o_descriptor->walk_probe);
@@ -434,7 +512,7 @@ inline void init_pp_descriptors(void **evset, pp_descriptors_t *o_descriptor, ct
     init_prime_descriptor(walk_probe, walk_prime, ctx);
 }
 
-inline void walk_descriptor_t_copy_to_iobuf(walk_descriptor_t *desc) {
+void walk_descriptor_t_copy_to_iobuf(walk_descriptor_t *desc) {
     for (uint64_t i = 0; i < desc->len; i++) {
         desc->rw_buffer[i] = desc->ro_chain[i];
     }
@@ -443,8 +521,8 @@ inline void walk_descriptor_t_copy_to_iobuf(walk_descriptor_t *desc) {
 void walk_descriptor_t_free(walk_descriptor_t *desc) {
     if (desc->ro_chain)
         free(desc->ro_chain);
-    if (desc->rw_buffer)
-        free(desc->rw_buffer);
+    // if (desc->rw_buffer)
+    //     free(desc->rw_buffer);
 }
 
 void pp_descriptors_t_free(pp_descriptors_t *desc) {
@@ -478,16 +556,32 @@ void print_res_test_primeprobe(void *evict_line, void **evset,
 #endif
 }
 
-uint64_t test_primeprobe(pagemap_t pr, ctx_t ctx) {
-    void *ev = ctx.ev;
+void print_primeprobe_desciptor(pp_descriptors_t *pp_desc) {
+    printf("walk_probe.rw_buffer=%p-%p\n", pp_desc->walk_probe.rw_buffer,
+           pp_desc->walk_probe.rw_buffer +
+               pp_desc->walk_probe.len * sizeof(uint64_t));
+    printf("walk_probe.ro_chain=%p\n", pp_desc->walk_probe.ro_chain);
+    for (uint64_t i = 0; i < pp_desc->walk_probe.len; i++)
+        printf("--[%" PRIu64 "]=%p\n", i,
+               (void *)(pp_desc->walk_probe.ro_chain[i]));
+    printf("walk_prime.rw_buffer=%p\n", pp_desc->walk_prime.rw_buffer);
+    printf("walk_prime.ro_chain=%p\n", pp_desc->walk_prime.ro_chain);
+    for (uint64_t i = 0; i < pp_desc->walk_prime.len; i++)
+        printf("--[%" PRIu64 "]=%p\n", i,
+               (void *)(pp_desc->walk_prime.ro_chain[i]));
+}
+
+uint64_t test_primeprobe(pagemap_t pr, ctx_t *ctx) {
+    void *ev = ctx->ev;
     void *pr_base = pr.p;
     uint64_t pr_size = pr.size;
     uint64_t nr_prime = args.cache_ways;
     uint64_t evict_cntr = 0;
-    uint64_t nr_available_ev;
-    void **prset = get_prime_set(ev, pr, &nr_available_ev);
-    // ctx.prime_set = prset;
-    assert(nr_available_ev >= nr_prime);
+
+    get_prime_set(pr, ctx);
+    void **prset = ctx->prime_set->list;
+    uint64_t nr_available_ev = ctx->prime_set->available;
+    assert((ctx->prime_set) && (prset) && (nr_available_ev >= nr_prime));
 
     uint64_t chain_evict[4] = {(uint64_t)ev, (uint64_t)ev, (uint64_t)ev,
                                (uint64_t)&walk_wrapper_tail};
@@ -496,12 +590,14 @@ uint64_t test_primeprobe(pagemap_t pr, ctx_t ctx) {
     __builtin___clear_cache((char *)ev, (char *)ev + LEN_PRIME_SNIPPET);
 
     pp_descriptors_t pp_desc;
-    init_pp_descriptors(prset, &pp_desc, ctx);
+    init_pp_descriptors(prset, &pp_desc, *ctx);
     uint64_t *rw_buffer_probe = pp_desc.walk_probe.rw_buffer;
     uint64_t *rw_buffer_prime = pp_desc.walk_prime.rw_buffer;
 
+    if (args.verbose) print_primeprobe_desciptor(&pp_desc);
+
     // Prime the cache set
-    for (int _prime = 0; _prime < ctx.prime_rounds_repeats; _prime++) {
+    for (int _prime = 0; _prime < ctx->prime_rounds_repeats; _prime++) {
         walk_descriptor_t_copy_to_iobuf(&(pp_desc.walk_prime));
         OPS_BARRIER(8);
         walk_wrapper_head(rw_buffer_prime);
@@ -510,7 +606,7 @@ uint64_t test_primeprobe(pagemap_t pr, ctx_t ctx) {
 
     { // do evict on demand!
         uint64_t iobuf_evict[4];
-        for (int i = 0; i < ctx.evict_repeats; i++) {
+        for (int i = 0; i < ctx->evict_repeats; i++) {
             // If we don't want eviction, create a shortcut to the tail.
             iobuf_evict[0] = args.do_eviction ? chain_evict[0] : chain_evict[3];
             iobuf_evict[1] = chain_evict[1];
@@ -539,11 +635,10 @@ uint64_t test_primeprobe(pagemap_t pr, ctx_t ctx) {
     for (int i = 0; i < nr_prime; i++) {
         evict_cntr += (rw_buffer_probe[i] > args.threshold_ns);
     }
-    if (ctx.dbg_print_res) print_res_test_primeprobe(ev, prset, rw_buffer_probe);
+    if (ctx->dbg_print_res)
+        print_res_test_primeprobe(ev, prset, rw_buffer_probe);
 
-
-    free(prset);
-    ctx.prime_set = NULL;
+    ctx_t_free_prime_set(ctx);
     pp_descriptors_t_free(&pp_desc);
     return evict_cntr;
 }
@@ -602,8 +697,6 @@ void test_latency() {
     test_icache_latency(pmap_tramp.p + 0x6c0, pmap_pr, &cache_fast,
                         &cache_slow);
     args.threshold_ns = (cache_fast + cache_slow) / 2;
-    // printf("FAST:%" PRIu64 " SLOW:%" PRIu64 " THRESHOLD:%" PRIu64 "\n",
-            // cache_fast, cache_slow, args.threshold_ns);
 }
 
 void init(int argc, char **argv) {
@@ -616,7 +709,8 @@ void init(int argc, char **argv) {
     init_shared_tramp();
     init_rw_buffer_shared();
     init_test_ptr();
-    if (args.threshold_ns == 0) test_latency();
+    if (args.threshold_ns == 0)
+        test_latency();
     print_env();
 #if defined(__aarch64__)
     if (args.pmu_event_id != (uint16_t)-1)
@@ -624,9 +718,7 @@ void init(int argc, char **argv) {
 #endif
 }
 
-void finish() {
-    pagemap_t_free(&pmap_tramp);
-}
+void finish() { pagemap_t_free(&pmap_tramp); }
 
 int main(int argc, char **argv) {
     init(argc, argv);
@@ -634,15 +726,15 @@ int main(int argc, char **argv) {
     for (uint64_t i=0; i<(1<<16); i+=(1<<6)){
         uint64_t ptr = (uint64_t)pmap_tramp.p + i;
         ctx_t ctx = {
-                .ev = test_ptr,
+                .ev = (void*)ptr,
                 .prime_rounds = 16,
-                .prime_rounds_repeats = 4,
+                .prime_rounds_repeats = 16,
                 .evict_repeats = 4,
-                .dbg_print_res = false,
+                .dbg_print_res = args.verbose,
             };
         uint64_t cntr_evicted = 0;
         for (int j=0; j<100; j++){
-            cntr_evicted += test_primeprobe(pmap_pr, ctx);
+            cntr_evicted += test_primeprobe(pmap_pr, &ctx);
         }
         printf("PTR=%p, PRIME_ROUNDS=%" PRIu64 ", PRIME_ROUNDS_REPEATS=%" PRIu64
                " => EVICTED=%" PRIu64 "\n",
