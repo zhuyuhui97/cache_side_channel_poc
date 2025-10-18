@@ -38,6 +38,7 @@
 #define SIZE_CACHE_LINE (1 << args.cache_offset_bits)
 #define CACHE_LINE_ALIGN(addr)                                                 \
     ((void *)((uint64_t)addr & ~(SIZE_CACHE_LINE - 1)))
+#define PAGE_ALIGN(addr) ((void *)((uint64_t)addr & ~(os_page_size - 1)))
 
 /* uarch-dependent definitions */
 #if defined(__x86_64__)
@@ -395,7 +396,7 @@ int virt_to_phys_user(uintptr_t *paddr, pid_t pid, uintptr_t vaddr) {
 
 void *get_rw_buffer_in_tramp(uint64_t size, pagemap_t tramp, ctx_t ctx) {
     // TODO: an additinal margin to prevent consecutive line prefetching
-    uint64_t prefetch_margin = 0;
+    uint64_t prefetch_margin = 2*os_page_size;
     uint64_t allowed_size = (SIZE_PRIME_GAP - SIZE_CACHE_LINE);
     if (size >= (args.tramp_size - SIZE_CACHE_LINE)) {
         fprintf(stderr,
@@ -422,15 +423,15 @@ void *get_rw_buffer_in_tramp(uint64_t size, pagemap_t tramp, ctx_t ctx) {
     }
     min = (CACHE_LINE_ALIGN(min) - prefetch_margin);
     max = (CACHE_LINE_ALIGN(max) + SIZE_CACHE_LINE + prefetch_margin);
-    uint64_t min_margin = min - tramp.p;
-    uint64_t max_margin = (tramp.p + tramp.size) - max;
+    uint64_t lower_space = min - tramp.p;
+    uint64_t upper_space = (tramp.p + tramp.size) - max;
 
     uint64_t scan_grow = 0;
     void *scan_start = NULL;
-    if (max_margin >= size) {
+    if (upper_space >= size) {
         scan_grow = 0;
         scan_start = max;
-    } else if (min_margin >= size) {
+    } else if (lower_space >= size) {
         scan_grow = -1;
         scan_start = min;
     } else {
@@ -724,8 +725,8 @@ int main(int argc, char **argv) {
         uint64_t ptr = (uint64_t)pmap_tramp.p + i;
         ctx_t ctx = {
             .ev = (void *)ptr,
-            .prime_rounds = 16,
-            .prime_rounds_repeats = 16,
+            .prime_rounds = 2,
+            .prime_rounds_repeats = 32,
             .evict_repeats = 4,
             .dbg_print_res = args.verbose,
         };
