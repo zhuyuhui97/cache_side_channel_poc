@@ -101,11 +101,17 @@ typedef struct {
 } args_t;
 
 typedef struct {
-    void* ev;
+    void **list;
+    uint64_t available;
+    uint64_t size;
+} prime_set_t;
+
+typedef struct {
+    void *ev;
     uint64_t prime_rounds;
     uint64_t prime_rounds_repeats;
     uint64_t evict_repeats;
-    void **prime_set;
+    prime_set_t *prime_set;
     bool dbg_print_res;
 } ctx_t;
 
@@ -361,7 +367,7 @@ int virt_to_phys_user(uintptr_t *paddr, pid_t pid, uintptr_t vaddr) {
 }
 
 inline void init_probe_descriptor(void **evset,
-                                  walk_descriptor_t *o_walk_probe) {
+                                  walk_descriptor_t *o_walk_probe, ctx_t ctx) {
     uint64_t nr_prime = args.cache_ways;
     uint64_t len = nr_prime + 1;
     // create probe chain
@@ -424,7 +430,7 @@ inline void init_pp_descriptors(void **evset, pp_descriptors_t *o_descriptor, ct
                                 (char *)evset[i] + LEN_PRIME_SNIPPET);
     }
     // initialize descriptors
-    init_probe_descriptor(evset, walk_probe);
+    init_probe_descriptor(evset, walk_probe, ctx);
     init_prime_descriptor(walk_probe, walk_prime, ctx);
 }
 
@@ -480,7 +486,7 @@ uint64_t test_primeprobe(pagemap_t pr, ctx_t ctx) {
     uint64_t evict_cntr = 0;
     uint64_t nr_available_ev;
     void **prset = get_prime_set(ev, pr, &nr_available_ev);
-    ctx.prime_set = prset;
+    // ctx.prime_set = prset;
     assert(nr_available_ev >= nr_prime);
 
     uint64_t chain_evict[4] = {(uint64_t)ev, (uint64_t)ev, (uint64_t)ev,
