@@ -1,9 +1,10 @@
 #define RPAR_DATA       x0
+#define RPAR_REPEAT     x1
 #define RLOC_PRE_CCNTR  x9
 #define RLOC_POST_CCNTR x10
 #define RLOC_BR         x11
 #define RLOC_IDX        x12
-#define RLOC_PRE_EVCNTR  x13
+#define RLOC_PRE_EVCNTR x13
 #define RLOC_POST_L2REF x14
 
 .global walk_wrapper_head
@@ -23,7 +24,13 @@ walk_wrapper_head:
 walk_wrapper_tail:
     mrs RLOC_POST_L2REF, pmevcntr0_el0
     sub RLOC_POST_L2REF, RLOC_POST_L2REF, RLOC_PRE_EVCNTR
+    add RLOC_IDX, RLOC_IDX, 1 // walk_step_t[x].o_cycle
     str RLOC_POST_L2REF, [RPAR_DATA, RLOC_IDX, lsl #3]
+    sub RPAR_REPEAT, RPAR_REPEAT, #1
+    cmp RPAR_REPEAT, #0
+    b.eq return
+    b walk_wrapper_head
+return:
     ret
 .global walk_wrapper_end
 walk_wrapper_end:
@@ -35,12 +42,13 @@ prime_snippet:
     isb
     nop
     nop
+    add RLOC_IDX, RLOC_IDX, 1 // walk_step_t[x].o_cycle
     mrs RLOC_POST_CCNTR, pmccntr_el0
     // store ccntr
     sub RLOC_POST_CCNTR, RLOC_POST_CCNTR, RLOC_PRE_CCNTR
     str RLOC_POST_CCNTR, [RPAR_DATA, RLOC_IDX, lsl #3]
     // inc index
-    add RLOC_IDX, RLOC_IDX, 1
+    add RLOC_IDX, RLOC_IDX, 1 // walk_step_t[x+1].i_target
     // load next addr
     ldr RLOC_BR, [RPAR_DATA, RLOC_IDX, lsl #3]
     dsb sy

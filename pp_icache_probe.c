@@ -78,8 +78,12 @@
 const bool dont_br = false, do_br = true;
 
 typedef struct {
-    uint64_t *ro_chain;
-    uint64_t *rw_buffer;
+    uint64_t i_target;
+    uint64_t o_cycle;
+} walk_step_t;
+
+typedef struct {
+    walk_step_t* walk_buffer;
     uint64_t len;
 } walk_descriptor_t;
 
@@ -151,7 +155,7 @@ pagemap_t pmap_pr = {
 };
 
 extern uint8_t prime_snippet, prime_snippet_end;
-void walk_wrapper_head(uint64_t *buf);
+void walk_wrapper_head(walk_step_t *buf, uint64_t repeat);
 extern uint8_t walk_wrapper_tail, walk_wrapper_end;
 
 static struct argp_option options[] = {
@@ -254,29 +258,26 @@ void test_icache_latency(void *probe, pagemap_t pmap, uint64_t *o_fast,
     memcpy(probe, &prime_snippet, LEN_PRIME_SNIPPET);
     __builtin___clear_cache((char *)probe, (char *)probe + LEN_PRIME_SNIPPET);
     // make a jumping chain: head -> bridging snippet *->* probe snippet -> tail
-    uint64_t chain[3] = {(uint64_t)tramp, (uint64_t)tramp,
-                         (uint64_t)&walk_wrapper_tail};
-    uint64_t iobuf[3];
+
+    walk_step_t walkbuf[3] = {
+        {(uint64_t)tramp, 0},
+        {(uint64_t)tramp, 0},
+        {(uint64_t)&walk_wrapper_tail, 0},
+    };
 
     // test branch latency when target in icache
-    for (int i = 0; i < 4; i++) {
-        for (int i = 0; i < 3; i++)
-            iobuf[i] = chain[i];
-        OPS_BARRIER(8);
-        walk_wrapper_head(iobuf);
-        OPS_BARRIER(8);
-    }
-    *o_fast = iobuf[1];
+
+    walk_wrapper_head(walkbuf, 4);
+    OPS_BARRIER(8);
+    *o_fast = walkbuf[1].o_cycle;
 
     // test branch latency when target not in icache
     // BUG: we change the chain here to avoid BPU-guided prefetch
-    chain[1] = (uint64_t)probe;
-    for (int i = 0; i < 3; i++)
-        iobuf[i] = chain[i];
+    walkbuf[1].i_target = (uint64_t)probe;
     FLUSH_ICACHE(probe);
     OPS_BARRIER(0x20);
-    walk_wrapper_head(iobuf);
-    *o_slow = iobuf[1];
+    walk_wrapper_head(walkbuf, 1);
+    *o_slow = walkbuf[1].o_cycle;
     // clear the snippets
     memset(tramp, 0, LEN_PRIME_SNIPPET);
     __builtin___clear_cache((char *)tramp, (char *)tramp + LEN_PRIME_SNIPPET);
@@ -452,17 +453,15 @@ inline void init_probe_descriptor(void **evset, walk_descriptor_t *o_walk_probe,
     uint64_t nr_prime = args.cache_ways;
     uint64_t len = nr_prime + 1;
     // create probe chain
-    uint64_t *chain_probe = malloc(sizeof(uint64_t) * len);
-    uint64_t *iobuf_probe =
-        get_rw_buffer_in_tramp(sizeof(uint64_t) * len, pmap_tramp, ctx);
+    walk_step_t *walkbuf = malloc(sizeof(walk_step_t) * len);
+        // get_rw_buffer_in_tramp(sizeof(uint64_t) * len, pmap_tramp, ctx);
     for (int i = 0; i < nr_prime; i++) {
-        chain_probe[i] = (uint64_t)evset[nr_prime - i - 1];
+        walkbuf[i].i_target = (uint64_t)evset[nr_prime - i - 1];
     }
     // last jump to the tail
-    chain_probe[nr_prime] = (uint64_t)&walk_wrapper_tail;
+    walkbuf[nr_prime].i_target = (uint64_t)&walk_wrapper_tail;
 
-    o_walk_probe->ro_chain = chain_probe;
-    o_walk_probe->rw_buffer = iobuf_probe;
+    o_walk_probe->walk_buffer = walkbuf;
     o_walk_probe->len = len;
 }
 
@@ -470,33 +469,30 @@ inline void init_prime_descriptor(walk_descriptor_t *walk_probe,
                                   walk_descriptor_t *o_walk_prime, ctx_t ctx) {
     // walk the prime set back and forth
     uint64_t nr_rept = ctx.prime_rounds;
-    uint64_t *chain_probe = walk_probe->ro_chain;
+    walk_step_t *walkbuf_probe = walk_probe->walk_buffer;
     uint64_t nr_probe = (walk_probe->len) - 1; // exclude the tail
-    uint64_t len_chain_prime = ((nr_rept * (nr_probe - 1)) + 1);
-    uint64_t *chain_prime = malloc(sizeof(uint64_t) * len_chain_prime);
-    uint64_t *iobuf_prime = get_rw_buffer_in_tramp(
-        sizeof(uint64_t) * len_chain_prime, pmap_tramp, ctx);
+    uint64_t len = ((nr_rept * (nr_probe - 1)) + 1);
+    walk_step_t *walkbuf = malloc(sizeof(walk_step_t) * len);
     for (int i = 0; i < nr_rept; i++) {
         if (i % 2 == 0) {
             for (int j = 0; j < nr_probe - 1; j++)
-                chain_prime[i * (nr_probe - 1) + j] =
-                    chain_probe[nr_probe - j - 1];
+                walkbuf[i * (nr_probe - 1) + j].i_target =
+                    walkbuf_probe[nr_probe - j - 1].i_target;
         } else {
             for (int j = 0; j < nr_probe - 1; j++)
-                chain_prime[i * (nr_probe - 1) + j] = chain_probe[j];
+                walkbuf[i * (nr_probe - 1) + j].i_target =
+                    walkbuf_probe[j].i_target;
         }
     }
-    chain_prime[len_chain_prime - 1] = (uint64_t)&walk_wrapper_tail;
+    walkbuf[len - 1].i_target = (uint64_t)&walk_wrapper_tail;
 
-    o_walk_prime->ro_chain = chain_prime;
-    o_walk_prime->rw_buffer = iobuf_prime;
-    o_walk_prime->len = len_chain_prime;
+    o_walk_prime->walk_buffer = walkbuf;
+    o_walk_prime->len = len;
 }
 
 inline void init_pp_descriptors(void **evset, pp_descriptors_t *o_descriptor,
                                 ctx_t ctx) {
     uint64_t nr_prime = args.cache_ways;
-    uint64_t snippet_size = LEN_PRIME_SNIPPET;
     walk_descriptor_t *walk_probe = &(o_descriptor->walk_probe);
     walk_descriptor_t *walk_prime = &(o_descriptor->walk_prime);
     // copy prime snippet to all evset entries
@@ -510,15 +506,9 @@ inline void init_pp_descriptors(void **evset, pp_descriptors_t *o_descriptor,
     init_prime_descriptor(walk_probe, walk_prime, ctx);
 }
 
-void walk_descriptor_t_copy_to_iobuf(walk_descriptor_t *desc) {
-    for (uint64_t i = 0; i < desc->len; i++) {
-        desc->rw_buffer[i] = desc->ro_chain[i];
-    }
-}
-
 void walk_descriptor_t_free(walk_descriptor_t *desc) {
-    if (desc->ro_chain)
-        free(desc->ro_chain);
+    if (desc->walk_buffer)
+        free(desc->walk_buffer);
 }
 
 void pp_descriptors_t_free(pp_descriptors_t *desc) {
@@ -527,7 +517,7 @@ void pp_descriptors_t_free(pp_descriptors_t *desc) {
 }
 
 void print_res_test_primeprobe(void *evict_line, void **evset,
-                               uint64_t *rw_buffer_probe) {
+                               walk_step_t *walkbuf) {
     uint64_t nr_prime = args.cache_ways;
     assert(pid != -1);
     {
@@ -541,30 +531,31 @@ void print_res_test_primeprobe(void *evict_line, void **evset,
         uint p_idx = ((paddr & ((1 << args.cache_idx_bits) - 1)) >>
                       args.cache_offset_bits);
         printf("%d\tv=%p\tp=%p\tp_idx=%6x\t%" PRIu64, i, evset[i],
-               (void *)paddr, p_idx, rw_buffer_probe[i]);
-        printf((rw_buffer_probe[i] > args.threshold_ns) ? " *EVICTED*\n"
+               (void *)paddr, p_idx, walkbuf[i].o_cycle);
+        printf((walkbuf[i].o_cycle > args.threshold_ns) ? " *EVICTED*\n"
                                                         : "\n");
     }
 #if defined(__aarch64__)
     if (args.pmu_event_id != (uint16_t)-1)
         printf("PMU ev_0x%x=%d\n", args.pmu_event_id,
-               rw_buffer_probe[nr_prime]);
+               walkbuf[nr_prime].o_cycle);
 #endif
 }
 
 void print_primeprobe_desciptor(pp_descriptors_t *pp_desc) {
-    printf("walk_probe.rw_buffer=%p-%p\n", pp_desc->walk_probe.rw_buffer,
-           pp_desc->walk_probe.rw_buffer +
-               pp_desc->walk_probe.len * sizeof(uint64_t));
-    printf("walk_probe.ro_chain=%p\n", pp_desc->walk_probe.ro_chain);
+    walk_step_t *probe_walkbuf = pp_desc->walk_probe.walk_buffer;
+    void *probe_walkbuf_end = probe_walkbuf + pp_desc->walk_probe.len;
+    walk_step_t *prime_walkbuf = pp_desc->walk_prime.walk_buffer;
+    void *prime_walkbuf_end = prime_walkbuf + pp_desc->walk_prime.len;
+
+    printf("walk_probe.walkbuf= %p - %p\n", probe_walkbuf, probe_walkbuf_end);
     for (uint64_t i = 0; i < pp_desc->walk_probe.len; i++)
-        printf("--[%" PRIu64 "]=%p\n", i,
-               (void *)(pp_desc->walk_probe.ro_chain[i]));
-    printf("walk_prime.rw_buffer=%p\n", pp_desc->walk_prime.rw_buffer);
-    printf("walk_prime.ro_chain=%p\n", pp_desc->walk_prime.ro_chain);
+        printf("  --[%" PRIu64 "]=%p\n", i,
+               (void *)(probe_walkbuf[i].i_target));
+    printf("walk_prime.walkbuf= %p - %p\n", prime_walkbuf, prime_walkbuf_end);
     for (uint64_t i = 0; i < pp_desc->walk_prime.len; i++)
-        printf("--[%" PRIu64 "]=%p\n", i,
-               (void *)(pp_desc->walk_prime.ro_chain[i]));
+        printf("  --[%" PRIu64 "]=%p\n", i,
+               (void *)(prime_walkbuf[i].i_target));
 }
 
 uint64_t test_primeprobe(pagemap_t pr, ctx_t *ctx) {
@@ -579,42 +570,31 @@ uint64_t test_primeprobe(pagemap_t pr, ctx_t *ctx) {
     uint64_t nr_available_ev = ctx->prime_set->available;
     assert((ctx->prime_set) && (prset) && (nr_available_ev >= nr_prime));
 
-    uint64_t chain_evict[4] = {(uint64_t)ev, (uint64_t)ev, (uint64_t)ev,
-                               (uint64_t)&walk_wrapper_tail};
-
     memcpy((void *)ev, &prime_snippet, LEN_PRIME_SNIPPET);
     __builtin___clear_cache((char *)ev, (char *)ev + LEN_PRIME_SNIPPET);
 
     pp_descriptors_t pp_desc;
     init_pp_descriptors(prset, &pp_desc, *ctx);
-    uint64_t *rw_buffer_probe = pp_desc.walk_probe.rw_buffer;
-    uint64_t *rw_buffer_prime = pp_desc.walk_prime.rw_buffer;
+    walk_step_t *walkbuf_probe = pp_desc.walk_probe.walk_buffer;
+    walk_step_t *walkbuf_prime = pp_desc.walk_prime.walk_buffer;
 
     if (args.verbose)
         print_primeprobe_desciptor(&pp_desc);
 
     // Prime the cache set
-    for (int _prime = 0; _prime < ctx->prime_rounds_repeats; _prime++) {
-        walk_descriptor_t_copy_to_iobuf(&(pp_desc.walk_prime));
-        OPS_BARRIER(8);
-        walk_wrapper_head(rw_buffer_prime);
-        OPS_BARRIER(8);
-    }
+    walk_wrapper_head(walkbuf_prime, ctx->prime_rounds_repeats);
+
 
     { // do evict on demand!
-        uint64_t iobuf_evict[4];
-        for (int i = 0; i < ctx->evict_repeats; i++) {
-            // If we don't want eviction, create a shortcut to the tail.
-            iobuf_evict[0] = args.do_eviction ? chain_evict[0] : chain_evict[3];
-            iobuf_evict[1] = chain_evict[1];
-            iobuf_evict[2] = chain_evict[2];
-            iobuf_evict[3] = chain_evict[3];
-            // for (int j = 0; j < 4; j++)
-            //     printf("EVICT CHAIN[%d]=%p\n", j, (void *)iobuf_evict[j]);
-            OPS_BARRIER(8);
-            walk_wrapper_head(iobuf_evict);
-            OPS_BARRIER(8);
-        }
+        walk_step_t walkbuf_evict[4];
+        // if we don't want eviction, create a shortcut to the tail.
+        walkbuf_evict[0].i_target = args.do_eviction ? (uint64_t)ev : (uint64_t)&walk_wrapper_tail;
+        walkbuf_evict[1].i_target = (uint64_t)ev;
+        walkbuf_evict[2].i_target = (uint64_t)ev;
+        walkbuf_evict[3].i_target = (uint64_t)&walk_wrapper_tail;
+        OPS_BARRIER(8);
+        walk_wrapper_head(walkbuf_evict, ctx->evict_repeats);
+        OPS_BARRIER(8);
     }
     OPS_BARRIER(8);
 
@@ -624,16 +604,15 @@ uint64_t test_primeprobe(pagemap_t pr, ctx_t *ctx) {
     }
 #endif
 
-    walk_descriptor_t_copy_to_iobuf(&(pp_desc.walk_probe));
     // let's detect who has been evicted by *test_cursor
     OPS_BARRIER(8);
-    walk_wrapper_head(rw_buffer_probe);
+    walk_wrapper_head(walkbuf_probe, 1);
     OPS_BARRIER(8);
     for (int i = 0; i < nr_prime; i++) {
-        evict_cntr += (rw_buffer_probe[i] > args.threshold_ns);
+        evict_cntr += (walkbuf_probe[i].o_cycle > args.threshold_ns);
     }
     if (ctx->dbg_print_res)
-        print_res_test_primeprobe(ev, prset, rw_buffer_probe);
+        print_res_test_primeprobe(ev, prset, walkbuf_probe);
 
     ctx_t_free_prime_set(ctx);
     pp_descriptors_t_free(&pp_desc);
@@ -686,6 +665,7 @@ void init_test_ptr() {
 }
 
 void test_latency() {
+    // TODO: BROKEN!!!
     uint64_t cache_fast, cache_slow;
     void *pr_base = pmap_tramp.p + (args.tramp_size >> 1);
     pagemap_t pmap_pr = {
@@ -725,8 +705,8 @@ int main(int argc, char **argv) {
         uint64_t ptr = (uint64_t)pmap_tramp.p + i;
         ctx_t ctx = {
             .ev = (void *)ptr,
-            .prime_rounds = 2,
-            .prime_rounds_repeats = 32,
+            .prime_rounds = 4,
+            .prime_rounds_repeats = 64,
             .evict_repeats = 4,
             .dbg_print_res = args.verbose,
         };
