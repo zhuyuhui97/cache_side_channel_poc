@@ -35,10 +35,13 @@
 #define LEN_PRIME_SNIPPET (&prime_snippet_end - &prime_snippet)
 
 #define SIZE_PRIME_GAP (1 << args.cache_idx_bits)
+
 #define SIZE_CACHE_LINE (1 << args.cache_offset_bits)
-#define CACHE_LINE_ALIGN(addr)                                                 \
-    ((void *)((uint64_t)addr & ~(SIZE_CACHE_LINE - 1)))
-#define PAGE_ALIGN(addr) ((void *)((uint64_t)addr & ~(os_page_size - 1)))
+#define ALIGN_CACHE_LINE(addr) ((uint64_t)addr & ~(SIZE_CACHE_LINE - 1))
+#define OFFSET_IN_CACHE_LINE(addr) ((uint64_t)addr & (SIZE_CACHE_LINE - 1))
+
+#define ALIGN_PAGE(addr) ((void *)((uint64_t)addr & ~(os_page_size - 1)))
+#define OFFSET_IN_PAGE(addr) ((uint64_t)addr & (os_page_size - 1))
 
 /* uarch-dependent definitions */
 #if defined(__x86_64__)
@@ -83,8 +86,14 @@ typedef struct {
 } walk_step_t;
 
 typedef struct {
+    void *p;
+    uint64_t size;
+} pagemap_t;
+
+typedef struct {
     walk_step_t* walk_buffer;
     uint64_t len;
+    pagemap_t map;
 } walk_descriptor_t;
 
 typedef struct {
@@ -92,10 +101,6 @@ typedef struct {
     walk_descriptor_t walk_probe;
 } pp_descriptors_t;
 
-typedef struct {
-    void *p;
-    uint64_t size;
-} pagemap_t;
 
 typedef struct {
     void *tramp_base;
@@ -395,57 +400,26 @@ int virt_to_phys_user(uintptr_t *paddr, pid_t pid, uintptr_t vaddr) {
     return 0;
 }
 
-void *get_rw_buffer_in_tramp(uint64_t size, pagemap_t tramp, ctx_t ctx) {
-    // TODO: an additinal margin to prevent consecutive line prefetching
-    uint64_t prefetch_margin = 2*os_page_size;
-    uint64_t allowed_size = (SIZE_PRIME_GAP - SIZE_CACHE_LINE);
-    if (size >= (args.tramp_size - SIZE_CACHE_LINE)) {
+walk_step_t *walk_descriptor_t_map_buffer(uint64_t len, walk_descriptor_t *walk_d, ctx_t ctx) {
+    uint64_t size = len * sizeof(walk_step_t);
+    if (size > (os_page_size - SIZE_CACHE_LINE)) {
         fprintf(stderr,
                 "E: RW buffer bigger than trampoline! Requested %" PRIu64 "\n",
                 size);
         exit(-1);
     }
-    if (size >= allowed_size) { // WARNING: requested buffer is larger than a
-                                // gap between prime lines!
-        fprintf(stderr,
-                "W: RW buffer oversized. Allow %" PRIu64 ", requested %" PRIu64
-                "\n",
-                allowed_size, size);
-    }
-
-    void **prset = ctx.prime_set->list;
-    uint64_t nr_prime = args.cache_ways;
-    void *min = (void *)-1ULL, *max = NULL;
-    for (uint64_t i = 0; i < nr_prime; i++) {
-        if (prset[i] > max)
-            max = prset[i];
-        if (prset[i] < min)
-            min = prset[i];
-    }
-    min = (CACHE_LINE_ALIGN(min) - prefetch_margin);
-    max = (CACHE_LINE_ALIGN(max) + SIZE_CACHE_LINE + prefetch_margin);
-    uint64_t lower_space = min - tramp.p;
-    uint64_t upper_space = (tramp.p + tramp.size) - max;
-
-    uint64_t scan_grow = 0;
-    void *scan_start = NULL;
-    if (upper_space >= size) {
-        scan_grow = 0;
-        scan_start = max;
-    } else if (lower_space >= size) {
-        scan_grow = -1;
-        scan_start = min;
-    } else {
-        if (size >= allowed_size) {
-            fprintf(stderr, "E: No enough spaces between prime lines!\n");
-            exit(-1);
-        }
-        scan_grow = 0;
-        scan_start = prset[0];
-    }
-
-    void *o = CACHE_LINE_ALIGN(scan_start + scan_grow * size);
-    return o;
+    uint64_t ev = (uint64_t)ctx.ev;
+    uint64_t in_page_offset = OFFSET_IN_PAGE(ev);
+    // start from next cache line
+    in_page_offset = ALIGN_CACHE_LINE(in_page_offset + 4 * SIZE_CACHE_LINE);
+    void* map = mmap(NULL, 2*os_page_size, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    assert(map);
+    walk_d->map.size = 2 * os_page_size;
+    walk_d->map.p = map;
+    walk_d->walk_buffer = map + in_page_offset;
+    walk_d->len = len;
+    return (map + in_page_offset);
 }
 
 inline void init_probe_descriptor(void **evset, walk_descriptor_t *o_walk_probe,
@@ -453,16 +427,13 @@ inline void init_probe_descriptor(void **evset, walk_descriptor_t *o_walk_probe,
     uint64_t nr_prime = args.cache_ways;
     uint64_t len = nr_prime + 1;
     // create probe chain
-    walk_step_t *walkbuf = malloc(sizeof(walk_step_t) * len);
+    walk_step_t *walkbuf = walk_descriptor_t_map_buffer(len, o_walk_probe, ctx);
         // get_rw_buffer_in_tramp(sizeof(uint64_t) * len, pmap_tramp, ctx);
     for (int i = 0; i < nr_prime; i++) {
         walkbuf[i].i_target = (uint64_t)evset[nr_prime - i - 1];
     }
     // last jump to the tail
     walkbuf[nr_prime].i_target = (uint64_t)&walk_wrapper_tail;
-
-    o_walk_probe->walk_buffer = walkbuf;
-    o_walk_probe->len = len;
 }
 
 inline void init_prime_descriptor(walk_descriptor_t *walk_probe,
@@ -472,7 +443,7 @@ inline void init_prime_descriptor(walk_descriptor_t *walk_probe,
     walk_step_t *walkbuf_probe = walk_probe->walk_buffer;
     uint64_t nr_probe = (walk_probe->len) - 1; // exclude the tail
     uint64_t len = ((nr_rept * (nr_probe - 1)) + 1);
-    walk_step_t *walkbuf = malloc(sizeof(walk_step_t) * len);
+    walk_step_t *walkbuf = walk_descriptor_t_map_buffer(len, o_walk_prime, ctx);
     for (int i = 0; i < nr_rept; i++) {
         if (i % 2 == 0) {
             for (int j = 0; j < nr_probe - 1; j++)
@@ -485,9 +456,6 @@ inline void init_prime_descriptor(walk_descriptor_t *walk_probe,
         }
     }
     walkbuf[len - 1].i_target = (uint64_t)&walk_wrapper_tail;
-
-    o_walk_prime->walk_buffer = walkbuf;
-    o_walk_prime->len = len;
 }
 
 inline void init_pp_descriptors(void **evset, pp_descriptors_t *o_descriptor,
@@ -507,8 +475,13 @@ inline void init_pp_descriptors(void **evset, pp_descriptors_t *o_descriptor,
 }
 
 void walk_descriptor_t_free(walk_descriptor_t *desc) {
-    if (desc->walk_buffer)
-        free(desc->walk_buffer);
+    if (desc->map.p) {
+        munmap(desc->map.p, desc->map.size);
+        desc->map.p = NULL;
+        desc->map.size = 0;
+        desc->walk_buffer = NULL;
+        desc->len = 0;
+    }
 }
 
 void pp_descriptors_t_free(pp_descriptors_t *desc) {
@@ -549,13 +522,13 @@ void print_primeprobe_desciptor(pp_descriptors_t *pp_desc) {
     void *prime_walkbuf_end = prime_walkbuf + pp_desc->walk_prime.len;
 
     printf("walk_probe.walkbuf= %p - %p\n", probe_walkbuf, probe_walkbuf_end);
-    for (uint64_t i = 0; i < pp_desc->walk_probe.len; i++)
-        printf("  --[%" PRIu64 "]=%p\n", i,
-               (void *)(probe_walkbuf[i].i_target));
+    // for (uint64_t i = 0; i < pp_desc->walk_probe.len; i++)
+    //     printf("  --[%" PRIu64 "]=%p\n", i,
+    //            (void *)(probe_walkbuf[i].i_target));
     printf("walk_prime.walkbuf= %p - %p\n", prime_walkbuf, prime_walkbuf_end);
-    for (uint64_t i = 0; i < pp_desc->walk_prime.len; i++)
-        printf("  --[%" PRIu64 "]=%p\n", i,
-               (void *)(prime_walkbuf[i].i_target));
+    // for (uint64_t i = 0; i < pp_desc->walk_prime.len; i++)
+    //     printf("  --[%" PRIu64 "]=%p\n", i,
+    //            (void *)(prime_walkbuf[i].i_target));
 }
 
 uint64_t test_primeprobe(pagemap_t pr, ctx_t *ctx) {
@@ -705,8 +678,8 @@ int main(int argc, char **argv) {
         uint64_t ptr = (uint64_t)pmap_tramp.p + i;
         ctx_t ctx = {
             .ev = (void *)ptr,
-            .prime_rounds = 4,
-            .prime_rounds_repeats = 64,
+            .prime_rounds = 16,
+            .prime_rounds_repeats = 16,
             .evict_repeats = 4,
             .dbg_print_res = args.verbose,
         };
