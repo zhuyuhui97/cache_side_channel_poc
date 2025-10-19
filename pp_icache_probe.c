@@ -91,7 +91,7 @@ typedef struct {
 } pagemap_t;
 
 typedef struct {
-    walk_step_t* walk_buffer;
+    walk_step_t *walk_buffer;
     uint64_t len;
     pagemap_t map;
 } walk_descriptor_t;
@@ -100,7 +100,6 @@ typedef struct {
     walk_descriptor_t walk_prime;
     walk_descriptor_t walk_probe;
 } pp_descriptors_t;
-
 
 typedef struct {
     void *tramp_base;
@@ -179,6 +178,15 @@ static struct argp_option options[] = {
     {0}};
 
 static inline __attribute__((always_inline)) uint64_t read_cycles();
+static inline void prime_set_t_free(prime_set_t *pr_set);
+static inline void ctx_t_free_prime_set(ctx_t *ctx);
+static inline void
+init_probe_descriptor(void **evset, walk_descriptor_t *o_walk_probe, ctx_t ctx);
+static inline void init_prime_descriptor(walk_descriptor_t *walk_probe,
+                                         walk_descriptor_t *o_walk_prime,
+                                         ctx_t ctx);
+static inline void
+init_pp_descriptors(void **evset, pp_descriptors_t *o_descriptor, ctx_t ctx);
 
 static error_t parse_opt(int key, char *arg, struct argp_state *state) {
     switch (key) {
@@ -291,21 +299,22 @@ void test_icache_latency(void *probe, pagemap_t pmap, uint64_t *o_fast,
 }
 
 void get_prime_set(pagemap_t pmap, ctx_t *ctx) {
-    void *i_target = ctx->ev;
-    uint64_t *o_n;
-    void *pr_base = pmap.p;
+    void *ev = ctx->ev;
+    void *pr = pmap.p;
     uint64_t pr_len = pmap.size;
     uint64_t idx_bits = args.cache_idx_bits;
     uint64_t stride = 1 << idx_bits;
-    uint64_t mask = stride - 1;
-    uint64_t index = (uint64_t)i_target & mask;
-    uint64_t base_unaligned =
-        -(((uint64_t)pr_base & mask) != 0); // -1 when unaligned
+    uint64_t in_stride_mask = stride - 1;
+    uint64_t ev_in_stride_offset = (uint64_t)ev & in_stride_mask;
+    // -1 when unaligned, otherwise 0
+    uint64_t add_stride = -(((uint64_t)pr & in_stride_mask) != 0);
+
     uint64_t cursor =
-        (((uint64_t)pr_base & ~mask) | index) + (base_unaligned & stride);
-    uint64_t end = (uint64_t)pr_base + pr_len;
-    assert(((uint64_t)i_target < cursor) || (uint64_t)i_target > end);
-    uint64_t n = (1 & base_unaligned) + ((end - cursor) >> idx_bits);
+        (((uint64_t)pr & ~in_stride_mask) | ev_in_stride_offset) + (add_stride & stride);
+    uint64_t end = (uint64_t)pr + pr_len;
+    assert(((uint64_t)ev < cursor) || (uint64_t)ev > end);
+
+    uint64_t n = (1 & add_stride) + ((end - cursor) >> idx_bits);
     void **o_evset = malloc(n * sizeof(void *));
     for (int i = 0; i < n; i++) {
         assert(cursor < end);
@@ -400,7 +409,9 @@ int virt_to_phys_user(uintptr_t *paddr, pid_t pid, uintptr_t vaddr) {
     return 0;
 }
 
-walk_step_t *walk_descriptor_t_map_buffer(uint64_t len, walk_descriptor_t *walk_d, ctx_t ctx) {
+walk_step_t *walk_descriptor_t_map_buffer(uint64_t len,
+                                          walk_descriptor_t *walk_d,
+                                          ctx_t ctx) {
     uint64_t size = len * sizeof(walk_step_t);
     if (size > (os_page_size - SIZE_CACHE_LINE)) {
         fprintf(stderr,
@@ -412,7 +423,7 @@ walk_step_t *walk_descriptor_t_map_buffer(uint64_t len, walk_descriptor_t *walk_
     uint64_t in_page_offset = OFFSET_IN_PAGE(ev);
     // start from next cache line
     in_page_offset = ALIGN_CACHE_LINE(in_page_offset + 4 * SIZE_CACHE_LINE);
-    void* map = mmap(NULL, 2*os_page_size, PROT_READ | PROT_WRITE,
+    void *map = mmap(NULL, 2 * os_page_size, PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     assert(map);
     walk_d->map.size = 2 * os_page_size;
@@ -428,7 +439,6 @@ inline void init_probe_descriptor(void **evset, walk_descriptor_t *o_walk_probe,
     uint64_t len = nr_prime + 1;
     // create probe chain
     walk_step_t *walkbuf = walk_descriptor_t_map_buffer(len, o_walk_probe, ctx);
-        // get_rw_buffer_in_tramp(sizeof(uint64_t) * len, pmap_tramp, ctx);
     for (int i = 0; i < nr_prime; i++) {
         walkbuf[i].i_target = (uint64_t)evset[nr_prime - i - 1];
     }
@@ -550,25 +560,24 @@ uint64_t test_primeprobe(pagemap_t pr, ctx_t *ctx) {
     init_pp_descriptors(prset, &pp_desc, *ctx);
     walk_step_t *walkbuf_probe = pp_desc.walk_probe.walk_buffer;
     walk_step_t *walkbuf_prime = pp_desc.walk_prime.walk_buffer;
+    walk_step_t walkbuf_evict[4] = {
+        // if we don't want eviction, create a shortcut to the tail.
+        {args.do_eviction ? (uint64_t)ev : (uint64_t)&walk_wrapper_tail, 0},
+        {(uint64_t)ev, 0},
+        {(uint64_t)ev, 0},
+        {(uint64_t)&walk_wrapper_tail, 0}};
 
     if (args.verbose)
         print_primeprobe_desciptor(&pp_desc);
 
+    OPS_BARRIER(8);
     // Prime the cache set
     walk_wrapper_head(walkbuf_prime, ctx->prime_rounds_repeats);
+    OPS_BARRIER(8);
 
-
-    { // do evict on demand!
-        walk_step_t walkbuf_evict[4];
-        // if we don't want eviction, create a shortcut to the tail.
-        walkbuf_evict[0].i_target = args.do_eviction ? (uint64_t)ev : (uint64_t)&walk_wrapper_tail;
-        walkbuf_evict[1].i_target = (uint64_t)ev;
-        walkbuf_evict[2].i_target = (uint64_t)ev;
-        walkbuf_evict[3].i_target = (uint64_t)&walk_wrapper_tail;
-        OPS_BARRIER(8);
-        walk_wrapper_head(walkbuf_evict, ctx->evict_repeats);
-        OPS_BARRIER(8);
-    }
+    // do evict on demand!
+    OPS_BARRIER(8);
+    walk_wrapper_head(walkbuf_evict, ctx->evict_repeats);
     OPS_BARRIER(8);
 
 #if defined(DBG_FLUSH_EVSET)
@@ -684,7 +693,7 @@ int main(int argc, char **argv) {
             .dbg_print_res = args.verbose,
         };
         uint64_t cntr_evicted = 0;
-        for (int j = 0; j < 100; j++) {
+        for (int j = 0; j < 1000; j++) {
             cntr_evicted += test_primeprobe(pmap_pr, &ctx);
         }
         printf("PTR=%p, PRIME_ROUNDS=%" PRIu64 ", PRIME_ROUNDS_REPEATS=%" PRIu64
