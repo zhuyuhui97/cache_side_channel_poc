@@ -28,8 +28,7 @@ walk_wrapper_tail:
     str RLOC_POST_L2REF, [RPAR_DATA, RLOC_IDX, lsl #3]
     sub RPAR_REPEAT, RPAR_REPEAT, #1
     cmp RPAR_REPEAT, #0
-    b.eq return
-    b walk_wrapper_head
+    b.ne walk_wrapper_head
 return:
     ret
 .global walk_wrapper_end
