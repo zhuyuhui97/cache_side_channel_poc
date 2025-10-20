@@ -305,18 +305,20 @@ void get_prime_set(pagemap_t pmap, ctx_t *ctx) {
     uint64_t idx_bits = args.cache_idx_bits;
     uint64_t stride = 1 << idx_bits;
     uint64_t in_stride_mask = stride - 1;
+    uint64_t pr_in_stride_offset = (uint64_t)pr & in_stride_mask;
     uint64_t ev_in_stride_offset = (uint64_t)ev & in_stride_mask;
     // -1 when unaligned, otherwise 0
-    uint64_t add_stride = -(((uint64_t)pr & in_stride_mask) != 0);
+    uint64_t add_stride = -(ev_in_stride_offset < pr_in_stride_offset);
 
-    uint64_t cursor =
-        (((uint64_t)pr & ~in_stride_mask) | ev_in_stride_offset) + (add_stride & stride);
+    uint64_t cursor = (((uint64_t)pr & ~in_stride_mask) | ev_in_stride_offset);
+    cursor += (add_stride & stride);
     uint64_t end = (uint64_t)pr + pr_len;
     assert(((uint64_t)ev < cursor) || (uint64_t)ev > end);
 
-    uint64_t n = (1 & add_stride) + ((end - cursor) >> idx_bits);
+    uint64_t n = (1 & add_stride) + ((end - cursor - LEN_PRIME_SNIPPET) >> idx_bits);
     void **o_evset = malloc(n * sizeof(void *));
     for (int i = 0; i < n; i++) {
+        // printf("Prime set candidate[%d]: %p\n", i, (void *)cursor);
         assert(cursor < end);
         o_evset[i] = (void *)cursor;
         cursor += stride;
@@ -559,6 +561,7 @@ uint64_t test_primeprobe(pagemap_t pr, ctx_t *ctx) {
     pp_descriptors_t pp_desc;
     init_pp_descriptors(prset, &pp_desc, *ctx);
     walk_step_t *walkbuf_probe = pp_desc.walk_probe.walk_buffer;
+    int64_t repeat_prime = ctx->prime_rounds_repeats;
     walk_step_t *walkbuf_prime = pp_desc.walk_prime.walk_buffer;
     walk_step_t walkbuf_evict[4] = {
         // if we don't want eviction, create a shortcut to the tail.
@@ -566,18 +569,19 @@ uint64_t test_primeprobe(pagemap_t pr, ctx_t *ctx) {
         {(uint64_t)ev, 0},
         {(uint64_t)ev, 0},
         {(uint64_t)&walk_wrapper_tail, 0}};
+    uint64_t repeat_evict = ctx->evict_repeats;
 
-    if (args.verbose)
+    if (ctx->dbg_print_res)
         print_primeprobe_desciptor(&pp_desc);
 
     OPS_BARRIER(8);
     // Prime the cache set
-    walk_wrapper_head(walkbuf_prime, ctx->prime_rounds_repeats);
+    walk_wrapper_head(walkbuf_prime, repeat_prime);
     OPS_BARRIER(8);
 
     // do evict on demand!
     OPS_BARRIER(8);
-    walk_wrapper_head(walkbuf_evict, ctx->evict_repeats);
+    walk_wrapper_head(walkbuf_evict, repeat_evict);
     OPS_BARRIER(8);
 
 #if defined(DBG_FLUSH_EVSET)
@@ -643,7 +647,7 @@ void init_test_ptr() {
     assert(pmap_pr.p);
     test_ptr = pmap_pr.p +
                (args.offset_dbg_probe & ((1 << args.cache_idx_bits) - 1)) -
-               (12 << args.cache_idx_bits);
+               (0 << args.cache_idx_bits);
 }
 
 void test_latency() {
@@ -689,11 +693,12 @@ int main(int argc, char **argv) {
             .ev = (void *)ptr,
             .prime_rounds = 16,
             .prime_rounds_repeats = 16,
-            .evict_repeats = 4,
+            .evict_repeats = 128,
             .dbg_print_res = args.verbose,
         };
         uint64_t cntr_evicted = 0;
         for (int j = 0; j < 1000; j++) {
+            ctx.dbg_print_res = (j==0) & args.verbose;
             cntr_evicted += test_primeprobe(pmap_pr, &ctx);
         }
         printf("PTR=%p, PRIME_ROUNDS=%" PRIu64 ", PRIME_ROUNDS_REPEATS=%" PRIu64
