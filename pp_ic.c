@@ -16,6 +16,7 @@
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+#include <sched.h>
 #include "physmap.h"
 #include "env.h"
 #include "walk.h"
@@ -275,12 +276,13 @@ void print_primeprobe_desciptor(pp_descriptors_t *pp_desc) {
     //            (void *)(prime_walkbuf[i].i_target));
 }
 
-uint64_t test_primeprobe(pagemap_t pr, ctx_t *ctx) {
+uint64_t test_primeprobe(pagemap_t pr, ctx_t *ctx, register uint64_t repeat) {
     void *ev = ctx->ev;
     void *pr_base = pr.p;
     uint64_t pr_size = pr.size;
     uint64_t nr_prime = args.cache_ways;
-    uint64_t evict_cntr = 0;
+    register uint64_t evict_cntr = 0;
+    register uint64_t threshold = args.threshold_ns;
 
     get_prime_set(pr, ctx);
     void **prset = ctx->prime_set->list;
@@ -306,29 +308,33 @@ uint64_t test_primeprobe(pagemap_t pr, ctx_t *ctx) {
     if (ctx->dbg_print_res)
         print_primeprobe_desciptor(&pp_desc);
 
-    OPS_BARRIER(8);
-    // Prime the cache set
-    walk_wrapper_head(walkbuf_prime, repeat_prime);
-    OPS_BARRIER(8);
+    for (register int _repeat = 0; _repeat < repeat; _repeat++)
+    {
+        OPS_BARRIER(8);
+        // Prime the cache set
+        walk_wrapper_head(walkbuf_prime, repeat_prime);
+        OPS_BARRIER(8);
 
-    // do evict on demand!
-    OPS_BARRIER(8);
-    walk_wrapper_head(walkbuf_evict, repeat_evict);
-    OPS_BARRIER(8);
+        // do evict on demand!
+        OPS_BARRIER(8);
+        walk_wrapper_head(walkbuf_evict, repeat_evict);
+        OPS_BARRIER(8);
 
 #if defined(DBG_FLUSH_EVSET)
-    for (int i = 0; i < nr_prime; i++) {
-        FLUSH_ICACHE(evset[i]);
-    }
+        for (int i = 0; i < nr_prime; i++) {
+            FLUSH_ICACHE(evset[i]);
+        }
 #endif
 
-    // let's detect who has been evicted by *test_cursor
-    OPS_BARRIER(8);
-    walk_wrapper_head(walkbuf_probe, 1);
-    OPS_BARRIER(8);
-    for (int i = 0; i < nr_prime; i++) {
-        evict_cntr += (walkbuf_probe[i].o_cycle > args.threshold_ns);
+        // let's detect who has been evicted by *test_cursor
+        OPS_BARRIER(8);
+        walk_wrapper_head(walkbuf_probe, 1);
+        OPS_BARRIER(8);
+        for (register int i = 0; i < nr_prime; i++) {
+            evict_cntr += (walkbuf_probe[i].o_cycle > threshold);
+        }
     }
+
     if (ctx->dbg_print_res)
         print_res_test_primeprobe(ev, prset, walkbuf_probe);
 
@@ -423,21 +429,20 @@ int main(int argc, char **argv) {
         uint64_t ptr = (uint64_t)pmap_tramp.p + i;
         ctx_t ctx = {
             .ev = (void *)ptr,
-            .prime_rounds = 16,
-            .prime_rounds_repeats = 16,
+            .prime_rounds = 8,
+            .prime_rounds_repeats = 64,
             .evict_repeats = 128,
             .dbg_print_res = args.verbose,
             .cache_entry_size = LEN_PRIME_SNIPPET,
             .args = &args
         };
-        uint64_t cntr_evicted = 0;
-        for (int j = 0; j < 1000; j++) {
-            ctx.dbg_print_res = (j==0) & args.verbose;
-            cntr_evicted += test_primeprobe(pmap_pr, &ctx);
-        }
+        uint64_t cntr_evicted = test_primeprobe(pmap_pr, &ctx, 256);
         printf("PTR=%p, PRIME_ROUNDS=%" PRIu64 ", PRIME_ROUNDS_REPEATS=%" PRIu64
                " => EVICTED=%" PRIu64 "\n",
-               ptr, ctx.prime_rounds, ctx.prime_rounds_repeats, cntr_evicted);
+               ptr, ctx.prime_rounds, ctx.prime_rounds_repeats, cntr_evicted>>8);
+        fflush(stdout);
+        fflush(stderr);
+        sched_yield();
     }
 
     // ctx_t ctx = {
