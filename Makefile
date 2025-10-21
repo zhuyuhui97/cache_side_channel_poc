@@ -2,8 +2,10 @@
 CC := aarch64-linux-gnu-gcc
 CFLAGS :=
 
-dc_pp: physmap.h walk.h env.h pp_dcache_probe.c dc_probe_aarch64.S physmap.c walk.c
+all: pp_dc pp_ic
+
+pp_dc: physmap.h walk.h env.h pp_dc.c pp_dc_aarch64.S physmap.c walk.c
 	$(CC) $(CFLAGS) -static -O3 -g -DDBG_TIMER_HW $< -o $@
 
-ic_pp: physmap.h walk.h env.h pp_icache_probe.c ic_probe_aarch64.S physmap.c walk.c
+pp_ic: physmap.h walk.h env.h pp_ic.c pp_ic_aarch64.S physmap.c walk.c
 	$(CC) $(CFLAGS) -static -O3 -g -DDBG_TIMER_HW $< -o $@

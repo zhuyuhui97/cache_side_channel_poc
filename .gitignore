@@ -1,2 +1,4 @@
 .clang-format
 *.out
+pp_dc
+pp_ic
