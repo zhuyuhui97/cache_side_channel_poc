@@ -17,30 +17,14 @@
 #include <time.h>
 #include <unistd.h>
 #include "physmap.h"
+#include "env.h"
+#include "walk.h"
 
 #define NR_BPU_ACTV 4
 #define NR_BPU_TRAIN 32
-#define OFFSET_PROBE_INPAGE 0x2ca0
 #define FILL_BHB_LEN 600
-#define TRAMP_BITS_DEFAULT 26 // 64MB
-#define __NOP(x, rsh)                                                          \
-    asm volatile(".rept " MACRO_TO_STR(x >> rsh) "\n nop\n .endr")
-#define NOP(x) __NOP(x, 0)
-
-#define CALL_ADDR(x) ((void (*)(void))(x))()
-#define MEM_ACCESS(p) *(volatile unsigned char *)p
-#define MACRO_TO_STR(x) #x
 
 #define LEN_PRIME_SNIPPET (&prime_snippet_end - &prime_snippet)
-
-#define SIZE_PRIME_GAP (1 << args.cache_idx_bits)
-
-#define SIZE_CACHE_LINE (1 << args.cache_offset_bits)
-#define ALIGN_CACHE_LINE(addr) ((uint64_t)addr & ~(SIZE_CACHE_LINE - 1))
-#define OFFSET_IN_CACHE_LINE(addr) ((uint64_t)addr & (SIZE_CACHE_LINE - 1))
-
-#define ALIGN_PAGE(addr) ((void *)((uint64_t)addr & ~(os_page_size - 1)))
-#define OFFSET_IN_PAGE(addr) ((uint64_t)addr & (os_page_size - 1))
 
 /* uarch-dependent definitions */
 #if defined(__x86_64__)
@@ -79,56 +63,6 @@
 
 const bool dont_br = false, do_br = true;
 
-typedef struct {
-    uint64_t i_target;
-    uint64_t o_cycle;
-} walk_step_t;
-
-typedef struct {
-    void *p;
-    uint64_t size;
-} pagemap_t;
-
-typedef struct {
-    walk_step_t *walk_buffer;
-    uint64_t len;
-    pagemap_t map;
-} walk_descriptor_t;
-
-typedef struct {
-    walk_descriptor_t walk_prime;
-    walk_descriptor_t walk_probe;
-} pp_descriptors_t;
-
-typedef struct {
-    void *tramp_base;
-    uint64_t tramp_bits;
-    uint64_t tramp_size;
-    uint64_t cache_ways;
-    uint64_t cache_idx_bits;
-    uint64_t cache_offset_bits;
-    uint64_t offset_dbg_probe;
-    uint16_t pmu_event_id;
-    uint64_t threshold_ns;
-    bool do_eviction;
-    bool verbose;
-} args_t;
-
-typedef struct {
-    void **list;
-    uint64_t available;
-} prime_set_t;
-
-typedef struct {
-    void *ev;
-    uint64_t prime_rounds;
-    uint64_t prime_rounds_repeats;
-    uint64_t evict_repeats;
-    prime_set_t *prime_set;
-    bool dbg_print_res;
-    uint64_t cache_entry_size;
-} ctx_t;
-
 args_t args = {.tramp_base = NULL,
                .tramp_bits = TRAMP_BITS_DEFAULT,
                .tramp_size = (1 << TRAMP_BITS_DEFAULT),
@@ -162,97 +96,17 @@ extern uint8_t prime_snippet, prime_snippet_end;
 void walk_wrapper_head(walk_step_t *buf, uint64_t repeat);
 extern uint8_t walk_wrapper_tail, walk_wrapper_end;
 
-static struct argp_option options[] = {
-    {"tramp", 't', "TRAMPOLINE_BASE", 0, "Base address of trampoline."},
-    {"ways", 'w', "CACHE_WAYS", 0, "Number of ways."},
-    {"bits", 'b', "CACHE_IDX_BITS", 0, "Number of index bits."},
-    {"offset", 'o', "CACHE_OFFSET_BITS", 0, "Size of cache line, default 64b."},
-    {"size", 's', "TRAMPOLINE_BITS", 0,
-     "Bits of address span of the RET trampoline, size=(1<<TRAMPOLINE_BITS)."},
-    {"probe", 'p', "OFFSET", 0, "DEBUG: test offset of P+P probe"},
-    {"evict", 'e', NULL, 0, "DEBUG: do eviction"},
-    {"pmu-ev", 'm', "PMU_EVENT_ID", 0,
-     "DEBUG: PMU event to monitor (ARM only)."},
-    {"ns", 'n', "NANOSEC", 0, "Threshold in nanoseconds."},
-    {"verbose", 'v', NULL, 0, "Print debug information."},
-    {0}};
-
 static inline __attribute__((always_inline)) uint64_t read_cycles();
-static inline void prime_set_t_free(prime_set_t *pr_set);
-static inline void ctx_t_free_prime_set(ctx_t *ctx);
 static inline void
-init_probe_descriptor(void **evset, walk_descriptor_t *o_walk_probe, ctx_t ctx);
-static inline void init_prime_descriptor(walk_descriptor_t *walk_probe,
-                                         walk_descriptor_t *o_walk_prime,
-                                         ctx_t ctx);
+init_ic_probe_descriptor(void **evset, walk_descriptor_t *o_walk_probe, ctx_t ctx);
 static inline void
-init_pp_descriptors(void **evset, pp_descriptors_t *o_descriptor, ctx_t ctx);
+init_ic_prime_descriptor(walk_descriptor_t *walk_probe,
+                      walk_descriptor_t *o_walk_prime,
+                      ctx_t ctx);
+static inline void
+init_ic_pp_descriptors(void **evset, pp_descriptors_t *o_descriptor, ctx_t ctx);
 
-static error_t parse_opt(int key, char *arg, struct argp_state *state) {
-    switch (key) {
-    case 't':
-        args.tramp_base = (void *)strtoull(arg, NULL, 0);
-        break;
-    case 'w':
-        args.cache_ways = strtoull(arg, NULL, 0);
-        break;
-    case 'b':
-        args.cache_idx_bits = strtoull(arg, NULL, 0);
-        if (args.cache_idx_bits < 6) {
-            fprintf(stderr, "error: cache_idx_bits must be >= 6\n");
-            return ARGP_ERR_UNKNOWN;
-        }
-        break;
-    case 'o':
-        args.cache_offset_bits = strtoull(arg, NULL, 0);
-        break;
-    case 's':
-        args.tramp_bits = strtoull(arg, NULL, 0);
-        args.tramp_size = 1 << args.tramp_bits;
-        break;
-    case 'p':
-        args.offset_dbg_probe = strtoull(arg, NULL, 0);
-        break;
-    case 'e':
-        args.do_eviction = true;
-        break;
-    case 'm':
-        args.pmu_event_id = strtoull(arg, NULL, 0);
-        break;
-    case 'n':
-        args.threshold_ns = strtoull(arg, NULL, 0);
-        break;
-    case 'v':
-        args.verbose = true;
-        break;
-    default:
-        return ARGP_ERR_UNKNOWN;
-    }
-    return 0;
-}
-
-static struct argp argp = {options, parse_opt, NULL, NULL, NULL};
-
-/**
- * create a trampoline which matches the LLC size and fill with
- * ret opcodes
- */
-void *create_exec_tramp(uint32_t size, void *base) {
-    // size != 0
-    assert(size);
-    // create an anonymous, executable mapping
-    void *buf = mmap(base, (size_t)size, PROT_READ | PROT_WRITE | PROT_EXEC,
-                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    assert(buf != MAP_FAILED);
-    return buf;
-}
-
-void pagemap_t_free(pagemap_t *pmap) {
-    if (pmap->p)
-        munmap(pmap->p, pmap->size);
-}
-
-void test_dcache_latency(void *probe, pagemap_t pmap, uint64_t *o_fast,
+void test_icache_latency(void *probe, pagemap_t pmap, uint64_t *o_fast,
                          uint64_t *o_slow) {
     void *tramp = pmap.p;
     uint64_t tramp_size = pmap.size;
@@ -298,21 +152,6 @@ void test_dcache_latency(void *probe, pagemap_t pmap, uint64_t *o_fast,
     __builtin___clear_cache((char *)probe, (char *)probe + LEN_PRIME_SNIPPET);
 }
 
-inline void prime_set_t_free(prime_set_t *pr_set) {
-    if (pr_set->list) {
-        free(pr_set->list);
-        pr_set->list = NULL;
-    }
-}
-inline void ctx_t_free_prime_set(ctx_t *ctx) {
-    if (ctx->prime_set) {
-        prime_set_t_free(ctx->prime_set);
-        free(ctx->prime_set);
-        ctx->prime_set = NULL;
-    }
-}
-
-
 walk_step_t *walk_descriptor_t_map_buffer(uint64_t len,
                                           walk_descriptor_t *walk_d,
                                           ctx_t ctx) {
@@ -337,7 +176,7 @@ walk_step_t *walk_descriptor_t_map_buffer(uint64_t len,
     return (map + in_page_offset);
 }
 
-inline void init_probe_descriptor(void **evset, walk_descriptor_t *o_walk_probe,
+inline void init_ic_probe_descriptor(void **evset, walk_descriptor_t *o_walk_probe,
                                   ctx_t ctx) {
     uint64_t nr_prime = args.cache_ways;
     uint64_t len = nr_prime + 1;
@@ -350,7 +189,7 @@ inline void init_probe_descriptor(void **evset, walk_descriptor_t *o_walk_probe,
     walkbuf[nr_prime].i_target = (uint64_t)&walk_wrapper_tail;
 }
 
-inline void init_prime_descriptor(walk_descriptor_t *walk_probe,
+inline void init_ic_prime_descriptor(walk_descriptor_t *walk_probe,
                                   walk_descriptor_t *o_walk_prime, ctx_t ctx) {
     // walk the prime set back and forth
     uint64_t nr_rept = ctx.prime_rounds;
@@ -372,7 +211,7 @@ inline void init_prime_descriptor(walk_descriptor_t *walk_probe,
     walkbuf[len - 1].i_target = (uint64_t)&walk_wrapper_tail;
 }
 
-inline void init_pp_descriptors(void **evset, pp_descriptors_t *o_descriptor,
+inline void init_ic_pp_descriptors(void **evset, pp_descriptors_t *o_descriptor,
                                 ctx_t ctx) {
     uint64_t nr_prime = args.cache_ways;
     walk_descriptor_t *walk_probe = &(o_descriptor->walk_probe);
@@ -384,23 +223,8 @@ inline void init_pp_descriptors(void **evset, pp_descriptors_t *o_descriptor,
                                 (char *)evset[i] + LEN_PRIME_SNIPPET);
     }
     // initialize descriptors
-    init_probe_descriptor(evset, walk_probe, ctx);
-    init_prime_descriptor(walk_probe, walk_prime, ctx);
-}
-
-void walk_descriptor_t_free(walk_descriptor_t *desc) {
-    if (desc->map.p) {
-        munmap(desc->map.p, desc->map.size);
-        desc->map.p = NULL;
-        desc->map.size = 0;
-        desc->walk_buffer = NULL;
-        desc->len = 0;
-    }
-}
-
-void pp_descriptors_t_free(pp_descriptors_t *desc) {
-    walk_descriptor_t_free(&(desc->walk_prime));
-    walk_descriptor_t_free(&(desc->walk_probe));
+    init_ic_probe_descriptor(evset, walk_probe, ctx);
+    init_ic_prime_descriptor(walk_probe, walk_prime, ctx);
 }
 
 void print_res_test_primeprobe(void *evict_line, void **evset,
@@ -461,7 +285,7 @@ uint64_t test_primeprobe(pagemap_t pr, ctx_t *ctx) {
     __builtin___clear_cache((char *)ev, (char *)ev + LEN_PRIME_SNIPPET);
 
     pp_descriptors_t pp_desc;
-    init_pp_descriptors(prset, &pp_desc, *ctx);
+    init_ic_pp_descriptors(prset, &pp_desc, *ctx);
     walk_step_t *walkbuf_probe = pp_desc.walk_probe.walk_buffer;
     int64_t repeat_prime = ctx->prime_rounds_repeats;
     walk_step_t *walkbuf_prime = pp_desc.walk_prime.walk_buffer;
@@ -560,7 +384,7 @@ void test_latency() {
         .p = pr_base,
         .size = args.tramp_size >> 1,
     };
-    test_dcache_latency(pmap_tramp.p + 0x6c0, pmap_pr, &cache_fast,
+    test_icache_latency(pmap_tramp.p + 0x6c0, pmap_pr, &cache_fast,
                         &cache_slow);
     args.threshold_ns = (cache_fast + cache_slow) / 2;
 }
@@ -568,7 +392,7 @@ void test_latency() {
 void init(int argc, char **argv) {
     // TODO: handle different cache line size
     assert(LEN_PRIME_SNIPPET == 64);
-    argp_parse(&argp, argc, argv, 0, 0, NULL);
+    init_args(argc, argv);
     assert(args.offset_dbg_probe < args.tramp_size);
     os_page_size = getpagesize();
     pid = getpid();
@@ -597,7 +421,8 @@ int main(int argc, char **argv) {
             .prime_rounds_repeats = 16,
             .evict_repeats = 128,
             .dbg_print_res = args.verbose,
-            .cache_entry_size = LEN_PRIME_SNIPPET
+            .cache_entry_size = LEN_PRIME_SNIPPET,
+            .args = &args
         };
         uint64_t cntr_evicted = 0;
         for (int j = 0; j < 1000; j++) {
@@ -616,6 +441,7 @@ int main(int argc, char **argv) {
     //         .evict_repeats = 128,
     //         .dbg_print_res = false,
     //         .cache_entry_size = LEN_PRIME_SNIPPET
+    //         .args = &args
     //     };
     // test_primeprobe(pmap_pr, ctx);
     finish();

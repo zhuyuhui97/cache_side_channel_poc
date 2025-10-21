@@ -1,27 +1,14 @@
-#include <stdint.h>
+#ifndef _WALK_H_
+#define _WALK_H_
 
-typedef struct {
-    uint64_t i_target;
-    uint64_t o_cycle;
-} walk_step_t;
+#include "env.h"
 
-typedef struct {
-    void *p;
-    uint64_t size;
-} pagemap_t;
+void *create_exec_tramp(uint32_t size, void *base);
+void pagemap_t_free(pagemap_t *pmap);
+void prime_set_t_free(prime_set_t *pr_set);
+void ctx_t_free_prime_set(ctx_t *ctx);
+void walk_descriptor_t_free(walk_descriptor_t *desc);
+void pp_descriptors_t_free(pp_descriptors_t *desc);
+void get_prime_set(pagemap_t pmap, ctx_t *ctx);
 
-typedef struct {
-    walk_step_t *walk_buffer;
-    uint64_t len;
-    pagemap_t map;
-} walk_descriptor_t;
-
-typedef struct {
-    walk_descriptor_t walk_prime;
-    walk_descriptor_t walk_probe;
-} pp_descriptors_t;
-
-typedef struct {
-    void **list;
-    uint64_t available;
-} prime_set_t;
+#endif
