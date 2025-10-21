@@ -1,6 +1,5 @@
 /**
- * Probing executable addresses based on i$ prime+probe side channel.
- * Based on paper: *Speculative Probing: Hacking Blind in the Spectre Era*
+ * d$ prime+probe
  */
 
 #include <argp.h>
@@ -10,7 +9,6 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <sys/mman.h>
 #include <sys/types.h>
 #include <time.h>
@@ -145,28 +143,6 @@ inline void init_dc_probe_descriptor(void **evset, walk_descriptor_t *o_walk_pro
     }
     o_walk_probe->walk_buffer = walkbuf;
 }
-
-// inline void init_dc_prime_descriptor(walk_descriptor_t *walk_probe,
-//                                   walk_descriptor_t *o_walk_prime, ctx_t ctx) {
-//     // walk the prime set back and forth
-//     uint64_t nr_rept = ctx.prime_rounds;
-//     walk_step_t *walkbuf_probe = walk_probe->walk_buffer;
-//     uint64_t nr_probe = (walk_probe->len) - 1; // exclude the tail
-//     uint64_t len = ((nr_rept * (nr_probe - 1)) + 1);
-//     walk_step_t *walkbuf = NULL;
-//     for (int i = 0; i < nr_rept; i++) {
-//         if (i % 2 == 0) {
-//             for (int j = 0; j < nr_probe - 1; j++)
-//                 walkbuf[i * (nr_probe - 1) + j].i_target =
-//                     walkbuf_probe[nr_probe - j - 1].i_target;
-//         } else {
-//             for (int j = 0; j < nr_probe - 1; j++)
-//                 walkbuf[i * (nr_probe - 1) + j].i_target =
-//                     walkbuf_probe[j].i_target;
-//         }
-//     }
-//     walkbuf[len - 1].i_target = (uint64_t)&walk_wrapper_tail;
-// }
 
 inline void init_dc_pp_descriptors(void **evset, pp_descriptors_t *o_descriptor,
                                 ctx_t ctx) {
@@ -371,15 +347,5 @@ int main(int argc, char **argv) {
                ptr, ctx.prime_rounds, ctx.prime_rounds_repeats, cntr_evicted);
     }
 
-    // ctx_t ctx = {
-    //         .ev = test_cursor,
-    //         .prime_rounds = 256,
-    //         .prime_rounds_repeats = 256,
-    //         .evict_repeats = 128,
-    //         .dbg_print_res = false,
-    //         .cache_entry_size = LEN_PRIME_SNIPPET,
-    //         .args = &args
-    //     };
-    // test_primeprobe(pmap_pr, ctx);
     finish();
 }
