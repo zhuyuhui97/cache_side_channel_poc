@@ -126,6 +126,7 @@ typedef struct {
     uint64_t evict_repeats;
     prime_set_t *prime_set;
     bool dbg_print_res;
+    uint64_t cache_entry_size;
 } ctx_t;
 
 args_t args = {.tramp_base = NULL,
@@ -295,36 +296,6 @@ void test_dcache_latency(void *probe, pagemap_t pmap, uint64_t *o_fast,
     __builtin___clear_cache((char *)tramp, (char *)tramp + LEN_PRIME_SNIPPET);
     memset(probe, 0, LEN_PRIME_SNIPPET);
     __builtin___clear_cache((char *)probe, (char *)probe + LEN_PRIME_SNIPPET);
-}
-
-void get_prime_set(pagemap_t pmap, ctx_t *ctx) {
-    void *ev = ctx->ev;
-    void *pr = pmap.p;
-    uint64_t pr_len = pmap.size;
-    uint64_t idx_bits = args.cache_idx_bits;
-    uint64_t stride = 1 << idx_bits;
-    uint64_t in_stride_mask = stride - 1;
-    uint64_t pr_in_stride_offset = (uint64_t)pr & in_stride_mask;
-    uint64_t ev_in_stride_offset = (uint64_t)ev & in_stride_mask;
-    // -1 when unaligned, otherwise 0
-    uint64_t add_stride = -(ev_in_stride_offset < pr_in_stride_offset);
-
-    uint64_t cursor = (((uint64_t)pr & ~in_stride_mask) | ev_in_stride_offset);
-    cursor += (add_stride & stride);
-    uint64_t end = (uint64_t)pr + pr_len;
-    assert(((uint64_t)ev < cursor) || (uint64_t)ev > end);
-
-    uint64_t n = (1 & add_stride) + ((end - cursor - LEN_PRIME_SNIPPET) >> idx_bits);
-    void **o_evset = malloc(n * sizeof(void *));
-    for (int i = 0; i < n; i++) {
-        // printf("Prime set candidate[%d]: %p\n", i, (void *)cursor);
-        assert(cursor < end);
-        o_evset[i] = (void *)cursor;
-        cursor += stride;
-    }
-    ctx->prime_set = malloc(sizeof(prime_set_t));
-    ctx->prime_set->list = o_evset;
-    ctx->prime_set->available = n;
 }
 
 inline void prime_set_t_free(prime_set_t *pr_set) {
@@ -626,6 +597,7 @@ int main(int argc, char **argv) {
             .prime_rounds_repeats = 16,
             .evict_repeats = 128,
             .dbg_print_res = args.verbose,
+            .cache_entry_size = LEN_PRIME_SNIPPET
         };
         uint64_t cntr_evicted = 0;
         for (int j = 0; j < 1000; j++) {
@@ -643,6 +615,7 @@ int main(int argc, char **argv) {
     //         .prime_rounds_repeats = 256,
     //         .evict_repeats = 128,
     //         .dbg_print_res = false,
+    //         .cache_entry_size = LEN_PRIME_SNIPPET
     //     };
     // test_primeprobe(pmap_pr, ctx);
     finish();
