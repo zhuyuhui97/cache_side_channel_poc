@@ -106,6 +106,12 @@ init_ic_prime_descriptor(walk_descriptor_t *walk_probe,
 static inline void
 init_ic_pp_descriptors(void **evset, pp_descriptors_t *o_descriptor, ctx_t ctx);
 
+void speculative_br(uint64_t flag, register void* ptr) {
+    if (flag) { // make sure it is not in the cache!
+        CALL_ADDR(ptr);
+    }
+}
+
 void test_icache_latency(void *probe, pagemap_t pmap, uint64_t *o_fast,
                          uint64_t *o_slow) {
     void *tramp = pmap.p;
