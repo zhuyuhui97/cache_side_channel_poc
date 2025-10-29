@@ -63,6 +63,9 @@ prime_snippet_end:
 .align 6
 .global speculative_br
 speculative_br:
+    ldr  x0, speculative_br-32
+    ldr  x1, speculative_br-24
+    ldr  x0, [x0]
     cbz  x0, speculative_br_ret
     br   x1
 speculative_br_ret:

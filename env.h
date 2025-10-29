@@ -46,6 +46,11 @@ typedef struct {
 } pp_descriptors_t;
 
 typedef struct {
+    walk_descriptor_t ev_stub;
+    walk_descriptor_t ev_flag;
+} ev_descriptors_t;
+
+typedef struct {
     void **list;
     uint64_t available;
 } prime_set_t;

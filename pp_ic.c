@@ -107,8 +107,15 @@ init_ic_prime_descriptor(walk_descriptor_t *walk_probe,
 static inline void
 init_ic_pp_descriptors(void **evset, pp_descriptors_t *o_descriptor, ctx_t ctx);
 
+typedef uint64_t do_evict_t();
 void speculative_br(uint64_t flag, register void* ptr);
 extern uint8_t speculative_br_end;
+
+#define DO_EVICT_T_NR_PARAMS 4
+typedef struct {
+    uint64_t args[DO_EVICT_T_NR_PARAMS];
+    uint8_t snippet;
+} evict_stub_t;
 
 void test_icache_latency(void *probe, pagemap_t pmap, uint64_t *o_fast,
                          uint64_t *o_slow) {
@@ -173,7 +180,7 @@ walk_step_t *walk_descriptor_t_map_buffer(uint64_t len,
     // here let's avoid cache pollusion using non-overlapping in-page offsets
     // start from next cache line
     in_page_offset = ALIGN_CACHE_LINE(in_page_offset + 4 * SIZE_CACHE_LINE);
-    void *map = mmap(NULL, 2 * os_page_size, PROT_READ | PROT_WRITE,
+    void *map = mmap(NULL, 2 * os_page_size, PROT_READ | PROT_WRITE | PROT_EXEC,
                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     assert(map);
     walk_d->map.size = 2 * os_page_size;
@@ -234,6 +241,40 @@ inline void init_ic_pp_descriptors(void **evset, pp_descriptors_t *o_descriptor,
     init_ic_prime_descriptor(walk_probe, walk_prime, ctx);
 }
 
+inline evict_stub_t *init_ic_ev_stub(void **evset, walk_descriptor_t *o_descriptor,
+                                ctx_t ctx, walk_descriptor_t *i_ev_flag) {
+    uint64_t size_x = (uint64_t)(&speculative_br_end) - (uint64_t)(&speculative_br);
+    uint64_t size_rwx = 0;
+    size_rwx += sizeof(uint64_t) * DO_EVICT_T_NR_PARAMS;
+    size_rwx += size_x;
+    evict_stub_t *evd = (evict_stub_t *) walk_descriptor_t_map_buffer(size_rwx, o_descriptor, ctx);
+    evd->args[0] = (uint64_t) i_ev_flag->walk_buffer;
+    evd->args[1] = (uint64_t) ctx.ev;
+    evd->args[2] = 0xdeadbeef;
+    evd->args[3] = 0xbeefdead;
+    memcpy(&(evd->snippet), &speculative_br, size_x);
+    __builtin___clear_cache((char *)&(evd->snippet), (char *)&(evd->snippet) + size_x);
+    return evd;
+}
+
+inline void init_ic_ev_flag(void **evset, walk_descriptor_t *o_descriptor, ctx_t ctx) {
+    walk_descriptor_t_map_buffer(sizeof(uint64_t), o_descriptor, ctx);
+}
+
+inline void init_ic_ev_descriptors(void **evset, ev_descriptors_t *o_descriptor,
+                                ctx_t ctx) {
+    walk_descriptor_t *ev_stub = &(o_descriptor->ev_stub);
+    walk_descriptor_t *ev_flag = &(o_descriptor->ev_flag);
+    // initialize descriptors
+    init_ic_ev_flag(evset, ev_flag, ctx);
+    evict_stub_t *evd = init_ic_ev_stub(evset, ev_stub, ctx, ev_flag);
+}
+
+void ev_descriptors_t_free(ev_descriptors_t *desc) {
+    walk_descriptor_t_free(&(desc->ev_flag));
+    walk_descriptor_t_free(&(desc->ev_stub));
+}
+
 // TODO: rework logging
 void print_res_test_primeprobe(void *evict_line, void **evset,
                                walk_step_t *walkbuf) {
@@ -277,16 +318,16 @@ void print_primeprobe_desciptor(pp_descriptors_t *pp_desc) {
     //            (void *)(prime_walkbuf[i].i_target));
 }
 
-
 uint64_t prime_probe_ic(register walk_step_t *walkbuf_prime,
                         register uint64_t repeat_prime,
                         register walk_step_t *walkbuf_evict,
                         register uint64_t repeat_evict,
                         register walk_step_t *walkbuf_probe,
                         register uint64_t nr_prime,
-                        register uint64_t threshold)
-{
+                        register uint64_t threshold,
+                        register evict_stub_t *do_evict) {
     register uint64_t evict_cntr = 0;
+    do_evict_t *do_evict_entry = ((void *)do_evict) + (DO_EVICT_T_NR_PARAMS * sizeof(uint64_t));
     OPS_BARRIER(8);
     // Prime the cache set
     walk_wrapper_head(walkbuf_prime, repeat_prime);
@@ -294,7 +335,7 @@ uint64_t prime_probe_ic(register walk_step_t *walkbuf_prime,
 
     // do evict on demand!
     OPS_BARRIER(8);
-    walk_wrapper_head(walkbuf_evict, repeat_evict);
+    do_evict_entry();
     OPS_BARRIER(8);
 
 #if defined(DBG_FLUSH_EVSET)
@@ -330,7 +371,12 @@ uint64_t prime_probe_launcher(pagemap_t pr, ctx_t *ctx, register uint64_t repeat
     __builtin___clear_cache((char *)ev, (char *)ev + LEN_PRIME_SNIPPET);
 
     pp_descriptors_t pp_desc;
+    // walk_descriptor_t ev_desc;
+    ev_descriptors_t ev_desc;
     init_ic_pp_descriptors(prset, &pp_desc, *ctx);
+    init_ic_ev_descriptors(prset, &ev_desc, *ctx);
+    evict_stub_t *ev_stub = (evict_stub_t *) ev_desc.ev_stub.walk_buffer;
+    // ev_stub = init_ic_ev_stub(prset, &ev_desc, *ctx);
     register walk_step_t *walkbuf_probe = pp_desc.walk_probe.walk_buffer;
     register uint64_t repeat_prime = ctx->prime_rounds_repeats;
     register walk_step_t *walkbuf_prime = pp_desc.walk_prime.walk_buffer;
@@ -349,7 +395,7 @@ uint64_t prime_probe_launcher(pagemap_t pr, ctx_t *ctx, register uint64_t repeat
     for (register int _repeat = 0; _repeat < repeat; _repeat++) {
         evict_cntr +=
             prime_probe_ic(walkbuf_prime, repeat_prime, walkbuf_evict,
-                           repeat_evict, walkbuf_probe, nr_prime, threshold);
+                           repeat_evict, walkbuf_probe, nr_prime, threshold, ev_stub);
     }
 
     if (ctx->dbg_print_res)
@@ -357,6 +403,8 @@ uint64_t prime_probe_launcher(pagemap_t pr, ctx_t *ctx, register uint64_t repeat
 
     ctx_t_free_prime_set(ctx);
     pp_descriptors_t_free(&pp_desc);
+    ev_descriptors_t_free(&ev_desc);
+    // walk_descriptor_t_free(&ev_desc);
     return evict_cntr;
 }
 
