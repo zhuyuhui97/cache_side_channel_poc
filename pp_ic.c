@@ -107,11 +107,8 @@ init_ic_prime_descriptor(walk_descriptor_t *walk_probe,
 static inline void
 init_ic_pp_descriptors(void **evset, pp_descriptors_t *o_descriptor, ctx_t ctx);
 
-void speculative_br(uint64_t flag, register void* ptr) {
-    if (flag) { // make sure it is not in the cache!
-        CALL_ADDR(ptr);
-    }
-}
+void speculative_br(uint64_t flag, register void* ptr);
+extern uint8_t speculative_br_end;
 
 void test_icache_latency(void *probe, pagemap_t pmap, uint64_t *o_fast,
                          uint64_t *o_slow) {
@@ -133,6 +130,7 @@ void test_icache_latency(void *probe, pagemap_t pmap, uint64_t *o_fast,
     __builtin___clear_cache((char *)probe, (char *)probe + LEN_PRIME_SNIPPET);
     // make a jumping chain: head -> bridging snippet *->* probe snippet -> tail
 
+    // TODO: move to walk_descriptor_t_map_buffer to avoid cache pollution?
     walk_step_t walkbuf[3] = {
         {(uint64_t)tramp, 0},
         {(uint64_t)tramp, 0},
@@ -169,8 +167,10 @@ walk_step_t *walk_descriptor_t_map_buffer(uint64_t len,
                 size);
         exit(-1);
     }
+    // TODO: WARN when the buffer span may cover the in-page offset of p+p set, in case of cache pollution.
     uint64_t ev = (uint64_t)ctx.ev;
     uint64_t in_page_offset = OFFSET_IN_PAGE(ev);
+    // here let's avoid cache pollusion using non-overlapping in-page offsets
     // start from next cache line
     in_page_offset = ALIGN_CACHE_LINE(in_page_offset + 4 * SIZE_CACHE_LINE);
     void *map = mmap(NULL, 2 * os_page_size, PROT_READ | PROT_WRITE,
@@ -234,6 +234,7 @@ inline void init_ic_pp_descriptors(void **evset, pp_descriptors_t *o_descriptor,
     init_ic_prime_descriptor(walk_probe, walk_prime, ctx);
 }
 
+// TODO: rework logging
 void print_res_test_primeprobe(void *evict_line, void **evset,
                                walk_step_t *walkbuf) {
     uint64_t nr_prime = args.cache_ways;
@@ -276,7 +277,43 @@ void print_primeprobe_desciptor(pp_descriptors_t *pp_desc) {
     //            (void *)(prime_walkbuf[i].i_target));
 }
 
-uint64_t test_primeprobe(pagemap_t pr, ctx_t *ctx, register uint64_t repeat) {
+
+uint64_t prime_probe_ic(register walk_step_t *walkbuf_prime,
+                        register uint64_t repeat_prime,
+                        register walk_step_t *walkbuf_evict,
+                        register uint64_t repeat_evict,
+                        register walk_step_t *walkbuf_probe,
+                        register uint64_t nr_prime,
+                        register uint64_t threshold)
+{
+    register uint64_t evict_cntr = 0;
+    OPS_BARRIER(8);
+    // Prime the cache set
+    walk_wrapper_head(walkbuf_prime, repeat_prime);
+    OPS_BARRIER(8);
+
+    // do evict on demand!
+    OPS_BARRIER(8);
+    walk_wrapper_head(walkbuf_evict, repeat_evict);
+    OPS_BARRIER(8);
+
+#if defined(DBG_FLUSH_EVSET)
+    for (int i = 0; i < nr_prime; i++) {
+        FLUSH_ICACHE(evset[i]);
+    }
+#endif
+
+    // let's detect who has been evicted by *test_cursor
+    OPS_BARRIER(8);
+    walk_wrapper_head(walkbuf_probe, 1);
+    OPS_BARRIER(128);
+    for (register int i = 0; i < nr_prime; i++) {
+        evict_cntr += (walkbuf_probe[i].o_cycle > threshold);
+    }
+    return evict_cntr;
+}
+
+uint64_t prime_probe_launcher(pagemap_t pr, ctx_t *ctx, register uint64_t repeat) {
     void *ev = ctx->ev;
     void *pr_base = pr.p;
     uint64_t pr_size = pr.size;
@@ -294,45 +331,25 @@ uint64_t test_primeprobe(pagemap_t pr, ctx_t *ctx, register uint64_t repeat) {
 
     pp_descriptors_t pp_desc;
     init_ic_pp_descriptors(prset, &pp_desc, *ctx);
-    walk_step_t *walkbuf_probe = pp_desc.walk_probe.walk_buffer;
-    int64_t repeat_prime = ctx->prime_rounds_repeats;
-    walk_step_t *walkbuf_prime = pp_desc.walk_prime.walk_buffer;
+    register walk_step_t *walkbuf_probe = pp_desc.walk_probe.walk_buffer;
+    register uint64_t repeat_prime = ctx->prime_rounds_repeats;
+    register walk_step_t *walkbuf_prime = pp_desc.walk_prime.walk_buffer;
+    // TODO: move to walk_descriptor_t_map_buffer to avoid cache pollution
     walk_step_t walkbuf_evict[4] = {
         // if we don't want eviction, create a shortcut to the tail.
         {args.do_eviction ? (uint64_t)ev : (uint64_t)&walk_wrapper_tail, 0},
         {(uint64_t)ev, 0},
         {(uint64_t)ev, 0},
         {(uint64_t)&walk_wrapper_tail, 0}};
-    uint64_t repeat_evict = ctx->evict_repeats;
+    register uint64_t repeat_evict = ctx->evict_repeats;
 
     if (ctx->dbg_print_res)
         print_primeprobe_desciptor(&pp_desc);
 
-    for (register int _repeat = 0; _repeat < repeat; _repeat++)
-    {
-        OPS_BARRIER(8);
-        // Prime the cache set
-        walk_wrapper_head(walkbuf_prime, repeat_prime);
-        OPS_BARRIER(8);
-
-        // do evict on demand!
-        OPS_BARRIER(8);
-        walk_wrapper_head(walkbuf_evict, repeat_evict);
-        OPS_BARRIER(8);
-
-#if defined(DBG_FLUSH_EVSET)
-        for (int i = 0; i < nr_prime; i++) {
-            FLUSH_ICACHE(evset[i]);
-        }
-#endif
-
-        // let's detect who has been evicted by *test_cursor
-        OPS_BARRIER(8);
-        walk_wrapper_head(walkbuf_probe, 1);
-        OPS_BARRIER(8);
-        for (register int i = 0; i < nr_prime; i++) {
-            evict_cntr += (walkbuf_probe[i].o_cycle > threshold);
-        }
+    for (register int _repeat = 0; _repeat < repeat; _repeat++) {
+        evict_cntr +=
+            prime_probe_ic(walkbuf_prime, repeat_prime, walkbuf_evict,
+                           repeat_evict, walkbuf_probe, nr_prime, threshold);
     }
 
     if (ctx->dbg_print_res)
@@ -381,7 +398,7 @@ void init_test_ptr() {
     // TODO: remove magic number
     // TODO: only do this on a sub partition
     // TODO: check the border carefully
-    // TODO: check conflict with other prime entries
+    // TODO: check overlapping with other prime entries
     assert(pmap_pr.p);
     test_ptr = pmap_pr.p +
                (args.offset_dbg_probe & ((1 << args.cache_idx_bits) - 1)) -
@@ -429,17 +446,17 @@ int main(int argc, char **argv) {
         uint64_t ptr = (uint64_t)pmap_tramp.p + i;
         ctx_t ctx = {
             .ev = (void *)ptr,
-            .prime_rounds = 8,
-            .prime_rounds_repeats = 64,
+            .prime_rounds = 2,
+            .prime_rounds_repeats = 4,
             .evict_repeats = 128,
             .dbg_print_res = args.verbose,
             .cache_entry_size = LEN_PRIME_SNIPPET,
             .args = &args
         };
-        uint64_t cntr_evicted = test_primeprobe(pmap_pr, &ctx, 256);
+        uint64_t cntr_evicted = prime_probe_launcher(pmap_pr, &ctx, 1000);
         printf("PTR=%p, PRIME_ROUNDS=%" PRIu64 ", PRIME_ROUNDS_REPEATS=%" PRIu64
                " => EVICTED=%" PRIu64 "\n",
-               ptr, ctx.prime_rounds, ctx.prime_rounds_repeats, cntr_evicted>>8);
+               ptr, ctx.prime_rounds, ctx.prime_rounds_repeats, cntr_evicted);
         fflush(stdout);
         fflush(stderr);
         sched_yield();

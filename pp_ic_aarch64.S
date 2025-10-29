@@ -59,3 +59,13 @@ prime_snippet:
 .align 6
 .global prime_snippet_end
 prime_snippet_end:
+
+.align 6
+.global speculative_br
+speculative_br:
+    cbz  x0, speculative_br_ret
+    br   x1
+speculative_br_ret:
+    ret
+.global speculative_br_end
+speculative_br_end:
