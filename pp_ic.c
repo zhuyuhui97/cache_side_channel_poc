@@ -320,12 +320,11 @@ void print_primeprobe_desciptor(pp_descriptors_t *pp_desc) {
 
 uint64_t prime_probe_ic(register walk_step_t *walkbuf_prime,
                         register uint64_t repeat_prime,
-                        register walk_step_t *walkbuf_evict,
-                        register uint64_t repeat_evict,
                         register walk_step_t *walkbuf_probe,
                         register uint64_t nr_prime,
                         register uint64_t threshold,
-                        register evict_stub_t *do_evict) {
+                        register evict_stub_t *do_evict,
+                        register uint64_t repeat_evict) {
     register uint64_t evict_cntr = 0;
     do_evict_t *do_evict_entry = ((void *)do_evict) + (DO_EVICT_T_NR_PARAMS * sizeof(uint64_t));
     OPS_BARRIER(8);
@@ -371,22 +370,15 @@ uint64_t prime_probe_launcher(pagemap_t pr, ctx_t *ctx, register uint64_t repeat
     __builtin___clear_cache((char *)ev, (char *)ev + LEN_PRIME_SNIPPET);
 
     pp_descriptors_t pp_desc;
-    // walk_descriptor_t ev_desc;
     ev_descriptors_t ev_desc;
     init_ic_pp_descriptors(prset, &pp_desc, *ctx);
     init_ic_ev_descriptors(prset, &ev_desc, *ctx);
     evict_stub_t *ev_stub = (evict_stub_t *) ev_desc.ev_stub.walk_buffer;
-    // ev_stub = init_ic_ev_stub(prset, &ev_desc, *ctx);
+    ev_desc.ev_flag.walk_buffer->i_target = 0;
+
     register walk_step_t *walkbuf_probe = pp_desc.walk_probe.walk_buffer;
     register uint64_t repeat_prime = ctx->prime_rounds_repeats;
     register walk_step_t *walkbuf_prime = pp_desc.walk_prime.walk_buffer;
-    // TODO: move to walk_descriptor_t_map_buffer to avoid cache pollution
-    walk_step_t walkbuf_evict[4] = {
-        // if we don't want eviction, create a shortcut to the tail.
-        {args.do_eviction ? (uint64_t)ev : (uint64_t)&walk_wrapper_tail, 0},
-        {(uint64_t)ev, 0},
-        {(uint64_t)ev, 0},
-        {(uint64_t)&walk_wrapper_tail, 0}};
     register uint64_t repeat_evict = ctx->evict_repeats;
 
     if (ctx->dbg_print_res)
@@ -394,8 +386,8 @@ uint64_t prime_probe_launcher(pagemap_t pr, ctx_t *ctx, register uint64_t repeat
 
     for (register int _repeat = 0; _repeat < repeat; _repeat++) {
         evict_cntr +=
-            prime_probe_ic(walkbuf_prime, repeat_prime, walkbuf_evict,
-                           repeat_evict, walkbuf_probe, nr_prime, threshold, ev_stub);
+            prime_probe_ic(walkbuf_prime, repeat_prime,
+                           walkbuf_probe, nr_prime, threshold, ev_stub, repeat_evict);
     }
 
     if (ctx->dbg_print_res)
@@ -404,7 +396,6 @@ uint64_t prime_probe_launcher(pagemap_t pr, ctx_t *ctx, register uint64_t repeat
     ctx_t_free_prime_set(ctx);
     pp_descriptors_t_free(&pp_desc);
     ev_descriptors_t_free(&ev_desc);
-    // walk_descriptor_t_free(&ev_desc);
     return evict_cntr;
 }
 
