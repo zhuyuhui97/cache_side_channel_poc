@@ -89,7 +89,10 @@ typedef struct {
 
 extern args_t args;
 extern pid_t pid;
+extern uint64_t os_page_size;
+extern uint64_t os_page_offset_bits;
 
 error_t init_args(int argc, char **argv);
+error_t init_paging_info();
 
 #endif

@@ -84,9 +84,16 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
 
 static struct argp argp = {options, parse_opt, NULL, NULL, NULL};
 pid_t pid = -1;
+uint64_t os_page_size = 0;
+uint64_t os_page_offset_bits = 0;
 
 error_t init_args(int argc, char **argv) {
     return argp_parse(&argp, argc, argv, 0, 0, NULL);
 }
 
-
+error_t init_paging_info() {
+    os_page_size = getpagesize();
+    while (((os_page_size>>os_page_offset_bits)&1)==0) 
+        os_page_offset_bits++;
+    return 0;
+}

@@ -72,7 +72,6 @@ args_t args = {.tramp_base = NULL,
                .nr_repeat = 100,
                .evict_repeat = 4};
 
-uint64_t os_page_size = 0;
 void *test_ptr = NULL;
 
 pagemap_t pmap_tramp = {
@@ -312,7 +311,7 @@ void test_latency() {
 void init(int argc, char **argv) {
     init_args(argc, argv);
     assert(args.offset_dbg_probe < args.tramp_size);
-    os_page_size = getpagesize();
+    init_paging_info();
     pid = getpid();
     init_shared_tramp();
     // init_rw_buffer_shared();

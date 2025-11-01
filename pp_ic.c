@@ -80,7 +80,6 @@ args_t args = {.tramp_base = NULL,
                .prime_repeat = 4,
                .nr_repeat = 100};
 
-uint64_t os_page_size = 0;
 void *test_ptr = NULL;
 
 pagemap_t rw_buffer_shared = {
@@ -476,7 +475,7 @@ void init(int argc, char **argv) {
     assert(LEN_PRIME_SNIPPET == 64);
     init_args(argc, argv);
     assert(args.offset_dbg_probe < args.tramp_size);
-    os_page_size = getpagesize();
+    init_paging_info();
     pid = getpid();
     init_shared_tramp();
     init_rw_buffer_shared();

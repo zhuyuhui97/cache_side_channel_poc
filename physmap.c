@@ -74,8 +74,6 @@ int virt_to_phys_user(uintptr_t *paddr, pid_t pid, uintptr_t vaddr) {
     return 0;
 }
 
-#define PAGE_OFFSET_BITS 12
-#define PAGE_SIZE (1<<PAGE_OFFSET_BITS)
 // This is cheating!
 int peek_physmap(pagemap_t pmap, pid_t pid) {
     uint64_t base = (uint64_t) pmap.p;
@@ -96,7 +94,7 @@ int peek_physmap(pagemap_t pmap, pid_t pid) {
     memset(physmap_decode, 0, size);
     uint64_t in_way_mask = SIZE_PRIME_GAP-1;
     uint64_t pfn_in_cway_mask = nr_pm_decode_roots - 1;
-    for (uint64_t offset = 0; offset < span; offset += PAGE_SIZE) {
+    for (uint64_t offset = 0; offset < span; offset += os_page_size) {
         uintptr_t paddr;
         uint64_t vaddr = (uint64_t) base + offset;
         *((uint64_t *) vaddr) = 0; // force mapping the physical page immediately
