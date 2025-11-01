@@ -16,18 +16,20 @@
 #define MEM_ACCESS(p) *(volatile unsigned char *)p
 #define MACRO_TO_STR(x) #x
 
-#define SIZE_PRIME_GAP (1 << args.cache_idx_bits)
+#define SIZE_PRIME_GAP (1ULL << args.cache_idx_bits)
 
-#define SIZE_CACHE_LINE (1 << args.cache_offset_bits)
-#define ALIGN_CACHE_LINE(addr) ((uint64_t)addr & ~(SIZE_CACHE_LINE - 1))
-#define OFFSET_IN_CACHE_LINE(addr) ((uint64_t)addr & (SIZE_CACHE_LINE - 1))
+#define SIZE_CACHE_LINE (1ULL << args.cache_offset_bits)
+#define MASK_IN_CACHE_LINE (SIZE_CACHE_LINE - 1)
+#define ALIGN_CACHE_LINE(addr) ((uint64_t)addr & ~MASK_IN_CACHE_LINE)
+#define OFFSET_IN_CACHE_LINE(addr) ((uint64_t)addr & MASK_IN_CACHE_LINE)
 
-#define ALIGN_PAGE(addr) ((void *)((uint64_t)addr & ~(os_page_size - 1)))
-#define OFFSET_IN_PAGE(addr) ((uint64_t)addr & (os_page_size - 1))
+#define MASK_IN_PAGE (os_page_size - 1)
+#define ALIGN_PAGE(addr) ((void *)((uint64_t)addr & ~MASK_IN_PAGE))
+#define OFFSET_IN_PAGE(addr) ((uint64_t)addr & MASK_IN_PAGE)
 
-#define SIZE_CACHE_WAY (1 << args.cache_idx_bits)
-#define MASK_IN_CACHE (SIZE_CACHE_WAY - 1)
-#define IDX_IN_CACHE(addr) ((uint64_t)addr & (SIZE_CACHE_WAY - 1))
+#define SIZE_CACHE_WAY SIZE_PRIME_GAP
+#define MASK_IN_CACHE_WAY (SIZE_CACHE_WAY - 1)
+#define IDX_IN_CACHE_WAY(addr) ((uint64_t)addr & MASK_IN_CACHE_WAY)
 
 typedef struct {
     uint64_t i_target;

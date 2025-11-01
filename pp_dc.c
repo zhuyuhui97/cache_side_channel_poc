@@ -109,9 +109,9 @@ void test_dcache_latency(void *probe, pagemap_t pmap, uint64_t *o_fast,
 
 #define WALK_LEN 4
     uint64_t addr[WALK_LEN] = {
-        (uint64_t)tramp + (1 << args.cache_offset_bits) + (0 * sizeof(uint64_t)),
-        (uint64_t)tramp + (1 << args.cache_offset_bits) + (2 * sizeof(uint64_t)),
-        (uint64_t)tramp + (1 << args.cache_offset_bits) + (4 * sizeof(uint64_t)),
+        (uint64_t)tramp + SIZE_CACHE_LINE + (0 * sizeof(uint64_t)),
+        (uint64_t)tramp + SIZE_CACHE_LINE + (2 * sizeof(uint64_t)),
+        (uint64_t)tramp + SIZE_CACHE_LINE + (4 * sizeof(uint64_t)),
         (uint64_t)probe};
     walk_step_t walkbuf[4];
     for (int i = 0; i < WALK_LEN - 1; i++) {
@@ -172,8 +172,7 @@ void print_res_test_primeprobe(void *evict_line, void **evset,
     for (int i = 0; i < nr_prime; i++) {
         uintptr_t paddr;
         virt_to_phys_user(&paddr, pid, (uintptr_t)evset[i]);
-        uint p_idx = ((paddr & ((1 << args.cache_idx_bits) - 1)) >>
-                      args.cache_offset_bits);
+        uint p_idx = IDX_IN_CACHE_WAY(paddr) >> args.cache_offset_bits;
         uint64_t val = ((walk_step_t*)evset[i])->o_cycle;
         printf("%d\tv=%p\tp=%p\tp_idx=%6x\t%" PRIu64, i, evset[i],
                (void *)paddr, p_idx, val);
@@ -265,7 +264,7 @@ void print_env() {
     printf("=== USER VALUES ===\n");
     printf("Cache ways: %" PRIu64 "\n", args.cache_ways);
     printf("Cache index bits: %" PRIu64 " (cover %llu bytes)\n",
-           args.cache_idx_bits, (1ULL << args.cache_idx_bits));
+           args.cache_idx_bits, SIZE_CACHE_WAY);
     printf("Cache offset bits: %" PRIu64 "\n", args.cache_offset_bits);
     printf("Trampoline size: %" PRIu64 " bytes\n", args.tramp_size);
     printf("Test probe address: %p\n", test_ptr);
@@ -289,8 +288,7 @@ void init_test_ptr() {
     // TODO: check the border carefully
     // TODO: check conflict with other prime entries
     assert(pmap_pr.p);
-    test_ptr = pmap_pr.p +
-               (args.offset_dbg_probe & ((1 << args.cache_idx_bits) - 1)) -
+    test_ptr = pmap_pr.p + IDX_IN_CACHE_WAY(args.offset_dbg_probe) -
                (0 << args.cache_idx_bits);
 }
 

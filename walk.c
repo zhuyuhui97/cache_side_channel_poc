@@ -62,7 +62,7 @@ void get_prime_set_from_pagemap(pagemap_t pmap, ctx_t *ctx) {
     uintptr_t paddr;
     virt_to_phys_user(&paddr, pid, (uintptr_t)ev);
     assert(args.cache_idx_bits >= os_page_offset_bits); // TODO: move to args
-    uint64_t group_index = IDX_IN_CACHE(paddr) >> os_page_offset_bits;
+    uint64_t group_index = IDX_IN_CACHE_WAY(paddr) >> os_page_offset_bits;
     physmap_decode_t *group = physmap_decode[group_index];
     physmap_decode_t *cursor = group;
     uint64_t page_count = 0;
