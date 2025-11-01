@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <argp.h>
+#include <unistd.h>
 
 #define OFFSET_PROBE_INPAGE 0x2ca0
 #define TRAMP_BITS_DEFAULT 26 // 64MB
@@ -68,13 +69,18 @@ typedef struct {
     uint64_t threshold_ns;
     bool do_eviction;
     bool verbose;
+    bool peek_phys_map;
+    uint64_t prime_sweep;
+    uint64_t prime_repeat;
+    uint64_t nr_repeat;
+    uint64_t evict_repeat;
 } args_t;
 
 typedef struct {
     void *ev;
-    uint64_t prime_rounds;
-    uint64_t prime_rounds_repeats;
-    uint64_t evict_repeats;
+    uint64_t prime_sweep;
+    uint64_t prime_repeat;
+    uint64_t evict_repeat;
     prime_set_t *prime_set;
     bool dbg_print_res;
     uint64_t cache_entry_size;
@@ -82,6 +88,7 @@ typedef struct {
 } ctx_t;
 
 extern args_t args;
+extern pid_t pid;
 
 error_t init_args(int argc, char **argv);
 

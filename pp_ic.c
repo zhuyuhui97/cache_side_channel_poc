@@ -74,10 +74,13 @@ args_t args = {.tramp_base = NULL,
                .pmu_event_id = -1,
                .threshold_ns = 0,
                .do_eviction = false,
-               .verbose = false};
+               .verbose = false,
+               .peek_phys_map = false,
+               .prime_sweep = 2,
+               .prime_repeat = 4,
+               .nr_repeat = 100};
 
 uint64_t os_page_size = 0;
-uint64_t pid = -1;
 void *test_ptr = NULL;
 
 pagemap_t rw_buffer_shared = {
@@ -206,7 +209,7 @@ inline void init_ic_probe_descriptor(void **evset, walk_descriptor_t *o_walk_pro
 inline void init_ic_prime_descriptor(walk_descriptor_t *walk_probe,
                                   walk_descriptor_t *o_walk_prime, ctx_t ctx) {
     // walk the prime set back and forth
-    uint64_t nr_rept = ctx.prime_rounds;
+    uint64_t nr_rept = ctx.prime_sweep;
     walk_step_t *walkbuf_probe = walk_probe->walk_buffer;
     uint64_t nr_probe = (walk_probe->len) - 1; // exclude the tail
     uint64_t len = ((nr_rept * (nr_probe - 1)) + 1);
@@ -366,25 +369,36 @@ uint64_t prime_probe_launcher(pagemap_t pr, ctx_t *ctx, register uint64_t repeat
     uint64_t nr_available_ev = ctx->prime_set->available;
     assert((ctx->prime_set) && (prset) && (nr_available_ev >= nr_prime));
 
-    memcpy((void *)ev, &prime_snippet, LEN_PRIME_SNIPPET);
-    __builtin___clear_cache((char *)ev, (char *)ev + LEN_PRIME_SNIPPET);
-
     pp_descriptors_t pp_desc;
     ev_descriptors_t ev_desc;
     init_ic_pp_descriptors(prset, &pp_desc, *ctx);
     init_ic_ev_descriptors(prset, &ev_desc, *ctx);
     evict_stub_t *ev_stub = (evict_stub_t *) ev_desc.ev_stub.walk_buffer;
-    ev_desc.ev_flag.walk_buffer->i_target = 0;
 
     register walk_step_t *walkbuf_probe = pp_desc.walk_probe.walk_buffer;
-    register uint64_t repeat_prime = ctx->prime_rounds_repeats;
+    register uint64_t repeat_prime = ctx->prime_repeat;
     register walk_step_t *walkbuf_prime = pp_desc.walk_prime.walk_buffer;
-    register uint64_t repeat_evict = ctx->evict_repeats;
+    register uint64_t repeat_evict = ctx->evict_repeat;
 
     if (ctx->dbg_print_res)
         print_primeprobe_desciptor(&pp_desc);
 
+    // TODO: move this to init_ic_ev_descriptors and save it in a permanent address
+    uint64_t ret_addr = (uint64_t) ev_desc.ev_stub.walk_buffer
+                        + sizeof(uint64_t) * DO_EVICT_T_NR_PARAMS
+                        + (uint64_t)(&speculative_br_end) - (uint64_t)(&speculative_br)
+                        - sizeof(uint32_t);
+
     for (register int _repeat = 0; _repeat < repeat; _repeat++) {
+        ev_desc.ev_flag.walk_buffer->i_target = 1;
+        ev_desc.ev_stub.walk_buffer->o_cycle = ret_addr;
+        for (int j=0; j<32; j++)
+            prime_probe_ic(walkbuf_prime, repeat_prime,
+                            walkbuf_probe, nr_prime, threshold, ev_stub, repeat_evict);
+
+        ev_desc.ev_flag.walk_buffer->i_target = 0;
+        ev_desc.ev_stub.walk_buffer->o_cycle = (uint64_t) ev;
+        FLUSH_ICACHE(ev_desc.ev_flag.walk_buffer);
         evict_cntr +=
             prime_probe_ic(walkbuf_prime, repeat_prime,
                            walkbuf_probe, nr_prime, threshold, ev_stub, repeat_evict);
@@ -474,6 +488,8 @@ void init(int argc, char **argv) {
     if (args.pmu_event_id != (uint16_t)-1)
         INIT_PMU(0, args.pmu_event_id);
 #endif
+    if (args.peek_phys_map)
+        peek_physmap(pmap_tramp, pid);
 }
 
 void finish() { pagemap_t_free(&pmap_tramp); }
@@ -482,34 +498,23 @@ int main(int argc, char **argv) {
     init(argc, argv);
 
     for (uint64_t i = 0; i < (1 << 16); i += (1 << 6)) {
-        uint64_t ptr = (uint64_t)pmap_tramp.p + i;
+        uint64_t ptr = 0x400000 + i;
         ctx_t ctx = {
             .ev = (void *)ptr,
-            .prime_rounds = 2,
-            .prime_rounds_repeats = 4,
-            .evict_repeats = 128,
+            .prime_sweep = args.prime_sweep,
+            .prime_repeat = args.prime_repeat,
+            // .evict_repeat = 128,
             .dbg_print_res = args.verbose,
             .cache_entry_size = LEN_PRIME_SNIPPET,
             .args = &args
         };
-        uint64_t cntr_evicted = prime_probe_launcher(pmap_pr, &ctx, 1000);
+        uint64_t cntr_evicted = prime_probe_launcher(pmap_pr, &ctx, args.nr_repeat);
         printf("PTR=%p, PRIME_ROUNDS=%" PRIu64 ", PRIME_ROUNDS_REPEATS=%" PRIu64
                " => EVICTED=%" PRIu64 "\n",
-               ptr, ctx.prime_rounds, ctx.prime_rounds_repeats, cntr_evicted);
+               ptr, ctx.prime_sweep, ctx.prime_repeat, cntr_evicted);
         fflush(stdout);
         fflush(stderr);
         sched_yield();
     }
-
-    // ctx_t ctx = {
-    //         .ev = test_cursor,
-    //         .prime_rounds = 256,
-    //         .prime_rounds_repeats = 256,
-    //         .evict_repeats = 128,
-    //         .dbg_print_res = false,
-    //         .cache_entry_size = LEN_PRIME_SNIPPET
-    //         .args = &args
-    //     };
-    // test_primeprobe(pmap_pr, ctx);
     finish();
 }

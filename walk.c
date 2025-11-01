@@ -1,7 +1,10 @@
 #include <assert.h>
 #include <malloc.h>
+#include <stdint.h>
+#include <stdlib.h>
 #include <sys/mman.h>
 #include "env.h"
+#include "physmap.h"
 
 /**
  * create a trampoline which matches the LLC size and fill with
@@ -52,7 +55,44 @@ void pp_descriptors_t_free(pp_descriptors_t *desc) {
     walk_descriptor_t_free(&(desc->walk_probe));
 }
 
+
+#define PAGE_OFFSET_BITS 12
+void get_prime_set_from_pagemap(pagemap_t pmap, ctx_t *ctx) {
+    void *ev = ctx->ev;
+    void *pr = pmap.p;
+    uintptr_t paddr;
+    virt_to_phys_user(&paddr, pid, (uintptr_t)ev);
+    uint64_t group_index = (paddr & ((1<<args.cache_idx_bits)-1)) >> PAGE_OFFSET_BITS;
+    physmap_decode_t *group = physmap_decode[group_index];
+    physmap_decode_t *cursor = group;
+    uint64_t page_count = 0;
+    while (cursor) {
+        page_count++;
+        cursor = cursor->next;
+    }
+    cursor = group;
+
+    void **o_evset = malloc(page_count * sizeof(void *));
+    page_count = 0;
+    while (cursor) {
+        uint64_t vaddr = cursor->addr;
+        cursor = cursor->next;
+        vaddr &= ~((1<<PAGE_OFFSET_BITS)-1); // TODO: replace const
+        vaddr |= (uint64_t) ev & ((1<<PAGE_OFFSET_BITS)-1);
+        // if (abs((int)(vaddr - (uint64_t) ev))<0x40000) continue;
+        if (vaddr == (uint64_t) ev) continue;
+        o_evset[page_count] = (void*) vaddr;
+        page_count++;
+    }
+
+    ctx->prime_set = malloc(sizeof(prime_set_t));
+    ctx->prime_set->list = o_evset;
+    ctx->prime_set->available = page_count;
+}
+
 void get_prime_set(pagemap_t pmap, ctx_t *ctx) {
+    if (physmap_decode)
+        return get_prime_set_from_pagemap(pmap, ctx);
     void *ev = ctx->ev;
     void *pr = pmap.p;
     uint64_t cache_entry_size = ctx->cache_entry_size;

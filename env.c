@@ -1,5 +1,6 @@
 #include <argp.h>
 #include <stdlib.h>
+#include <sys/types.h>
 #include "env.h"
 
 
@@ -16,6 +17,11 @@ static struct argp_option options[] = {
      "DEBUG: PMU event to monitor (ARM only)."},
     {"ns", 'n', "NANOSEC", 0, "Threshold in nanoseconds."},
     {"verbose", 'v', NULL, 0, "Print debug information."},
+    {"repeat", 'r', "NR_REPEAT", 0, "Repeat P+P on single VA for NR_REPEAT times."},
+    {"peek-phys-map", 1000, NULL, 0, "Use page map to generate prime set, root required."},
+    {"prime-sweep", 1001, "NR_PR_SWEEP", 0, "Priming the cache set by N/2 sweeping between the first and the last prime entry (i.e. forward then backward)."},
+    {"prime-repeats", 1002, "NR_PR_REPEAT", 0, "Repeat NR_PR_SWEEP for NR_PR_REPEAT times"},
+    {"evict-repeats", 1003, "NR_EV_REPEAT", 0, "Repeat eviction for NR_EV_REPEAT times"},
     {0}};
 
 static error_t parse_opt(int key, char *arg, struct argp_state *state) {
@@ -55,6 +61,21 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
     case 'v':
         args.verbose = true;
         break;
+    case 'r':
+        args.nr_repeat = strtoull(arg, NULL, 0);
+        break;
+    case 1000:
+        args.peek_phys_map = true;
+        break;
+    case 1001:
+        args.prime_sweep = strtoull(arg, NULL, 0);
+        break;
+    case 1002:
+        args.prime_repeat = strtoull(arg, NULL, 0);
+        break;
+    case 1003:
+        args.evict_repeat = strtoull(arg, NULL, 0);
+        break;
     default:
         return ARGP_ERR_UNKNOWN;
     }
@@ -62,6 +83,7 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
 }
 
 static struct argp argp = {options, parse_opt, NULL, NULL, NULL};
+pid_t pid = -1;
 
 error_t init_args(int argc, char **argv) {
     return argp_parse(&argp, argc, argv, 0, 0, NULL);

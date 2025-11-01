@@ -65,10 +65,14 @@ args_t args = {.tramp_base = NULL,
                .pmu_event_id = -1,
                .threshold_ns = 0,
                .do_eviction = false,
-               .verbose = false};
+               .verbose = false,
+               .peek_phys_map = false,
+               .prime_sweep = 16,
+               .prime_repeat = 16,
+               .nr_repeat = 100,
+               .evict_repeat = 4};
 
 uint64_t os_page_size = 0;
-uint64_t pid = -1;
 void *test_ptr = NULL;
 
 pagemap_t pmap_tramp = {
@@ -131,7 +135,7 @@ void test_dcache_latency(void *probe, pagemap_t pmap, uint64_t *o_fast,
 
 }
 
-inline void init_dc_probe_descriptor(void **evset, walk_descriptor_t *o_walk_probe,
+void init_dc_probe_descriptor(void **evset, walk_descriptor_t *o_walk_probe,
                                   ctx_t ctx) {
     uint64_t nr_prime = args.cache_ways;
     uint64_t len = nr_prime + 1;
@@ -142,9 +146,10 @@ inline void init_dc_probe_descriptor(void **evset, walk_descriptor_t *o_walk_pro
         ptr->i_target = (uint64_t)evset[i+1];
     }
     o_walk_probe->walk_buffer = walkbuf;
+    // TODO: use a different type to mark partition of pagemap_t!
 }
 
-inline void init_dc_pp_descriptors(void **evset, pp_descriptors_t *o_descriptor,
+void init_dc_pp_descriptors(void **evset, pp_descriptors_t *o_descriptor,
                                 ctx_t ctx) {
     uint64_t nr_prime = args.cache_ways;
     walk_descriptor_t *walk_probe = &(o_descriptor->walk_probe);
@@ -199,7 +204,7 @@ void print_primeprobe_desciptor(pp_descriptors_t *pp_desc) {
     //            (void *)(prime_walkbuf[i].i_target));
 }
 
-uint64_t test_primeprobe(pagemap_t pr, ctx_t *ctx) {
+uint64_t prime_probe_launcher(pagemap_t pr, ctx_t *ctx) {
     void *ev = ctx->ev;
     void *pr_base = pr.p;
     uint64_t pr_size = pr.size;
@@ -214,15 +219,15 @@ uint64_t test_primeprobe(pagemap_t pr, ctx_t *ctx) {
     pp_descriptors_t pp_desc;
     init_dc_pp_descriptors(prset, &pp_desc, *ctx);
     walk_step_t *walkbuf_probe = pp_desc.walk_probe.walk_buffer;
-    int64_t repeat_prime = ctx->prime_rounds_repeats;
-    uint64_t repeat_evict = ctx->evict_repeats;
+    int64_t repeat_prime = ctx->prime_repeat;
+    uint64_t repeat_evict = ctx->evict_repeat;
 
     if (ctx->dbg_print_res)
         print_primeprobe_desciptor(&pp_desc);
 
     OPS_BARRIER(8);
     // Prime the cache set
-    walk_dc_prime(walkbuf_probe, nr_prime, ctx->prime_rounds_repeats);
+    walk_dc_prime(walkbuf_probe, nr_prime, ctx->prime_repeat);
     OPS_BARRIER(8);
 
     if (args.do_eviction) { // do evict on demand!
@@ -244,7 +249,7 @@ uint64_t test_primeprobe(pagemap_t pr, ctx_t *ctx) {
     OPS_BARRIER(8);
     for (int i = 0; i < nr_prime; i++) {
         uint64_t val = ((walk_step_t*)prset[i])->o_cycle;
-        evict_cntr += (walkbuf_probe[i].o_cycle > args.threshold_ns);
+        evict_cntr += (val > args.threshold_ns);
     }
     if (ctx->dbg_print_res)
         print_res_test_primeprobe(ev, prset, walkbuf_probe, ret);
@@ -319,6 +324,8 @@ void init(int argc, char **argv) {
     if (args.pmu_event_id != (uint16_t)-1)
         INIT_PMU(0, args.pmu_event_id);
 #endif
+    if (args.peek_phys_map)
+        peek_physmap(pmap_tramp, pid);
 }
 
 void finish() { pagemap_t_free(&pmap_tramp); }
@@ -330,21 +337,21 @@ int main(int argc, char **argv) {
         uint64_t ptr = (uint64_t)pmap_tramp.p + i;
         ctx_t ctx = {
             .ev = (void *)ptr,
-            .prime_rounds = 16,
-            .prime_rounds_repeats = 16,
-            .evict_repeats = 128,
+            .prime_sweep = args.prime_sweep,
+            .prime_repeat = args.prime_repeat,
+            .evict_repeat = args.evict_repeat,
             .dbg_print_res = args.verbose,
             .cache_entry_size = sizeof(walk_step_t),
             .args = &args
         };
         uint64_t cntr_evicted = 0;
-        for (int j = 0; j < 1000; j++) {
+        for (int j = 0; j < args.nr_repeat; j++) {
             ctx.dbg_print_res = (j==0) & args.verbose;
-            cntr_evicted += test_primeprobe(pmap_pr, &ctx);
+            cntr_evicted += prime_probe_launcher(pmap_pr, &ctx);
         }
         printf("PTR=%p, PRIME_ROUNDS=%" PRIu64 ", PRIME_ROUNDS_REPEATS=%" PRIu64
                " => EVICTED=%" PRIu64 "\n",
-               ptr, ctx.prime_rounds, ctx.prime_rounds_repeats, cntr_evicted);
+               ptr, ctx.prime_sweep, ctx.prime_repeat, cntr_evicted);
     }
 
     finish();
