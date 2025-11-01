@@ -25,6 +25,10 @@
 #define ALIGN_PAGE(addr) ((void *)((uint64_t)addr & ~(os_page_size - 1)))
 #define OFFSET_IN_PAGE(addr) ((uint64_t)addr & (os_page_size - 1))
 
+#define SIZE_CACHE_WAY (1 << args.cache_idx_bits)
+#define MASK_IN_CACHE (SIZE_CACHE_WAY - 1)
+#define IDX_IN_CACHE(addr) ((uint64_t)addr & (SIZE_CACHE_WAY - 1))
+
 typedef struct {
     uint64_t i_target;
     uint64_t o_cycle;

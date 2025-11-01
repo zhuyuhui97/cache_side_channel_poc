@@ -61,7 +61,8 @@ void get_prime_set_from_pagemap(pagemap_t pmap, ctx_t *ctx) {
     void *pr = pmap.p;
     uintptr_t paddr;
     virt_to_phys_user(&paddr, pid, (uintptr_t)ev);
-    uint64_t group_index = (paddr & ((1<<args.cache_idx_bits)-1)) >> os_page_offset_bits; //TODO: replace with macro
+    assert(args.cache_idx_bits >= os_page_offset_bits); // TODO: move to args
+    uint64_t group_index = IDX_IN_CACHE(paddr) >> os_page_offset_bits;
     physmap_decode_t *group = physmap_decode[group_index];
     physmap_decode_t *cursor = group;
     uint64_t page_count = 0;
@@ -77,7 +78,7 @@ void get_prime_set_from_pagemap(pagemap_t pmap, ctx_t *ctx) {
         uint64_t vaddr = cursor->addr;
         cursor = cursor->next;
         vaddr &= ~((1<<os_page_offset_bits)-1); // TODO: replace with macro
-        vaddr |= (uint64_t) ev & ((1<<os_page_offset_bits)-1);
+        vaddr |= OFFSET_IN_PAGE(ev);
         // if (abs((int)(vaddr - (uint64_t) ev))<0x40000) continue;
         if (vaddr == (uint64_t) ev) continue;
         o_evset[page_count] = (void*) vaddr;
