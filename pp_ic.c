@@ -124,10 +124,9 @@ void test_icache_latency(void *probe, pagemap_t pmap, uint64_t *o_fast,
     void *tramp = pmap.p;
     uint64_t tramp_size = pmap.size;
     // test branch latency when target in icache
-    probe = (void *)((uint64_t)probe & ~((1 << args.cache_offset_bits) -
-                                         1)); // align to cache line
-    assert((probe < tramp) ||
-           (probe >= (tramp + tramp_size))); // not in the same region
+    probe = (void *) ALIGN_CACHE_LINE(probe);
+    // not in the same region
+    assert((probe < tramp) || (probe >= (tramp + tramp_size)));
 
     printf("Test addr: %p\n", probe);
     fflush(stdout);
