@@ -110,8 +110,7 @@ static inline void
 init_ic_pp_descriptors(void **evset, pp_descriptors_t *o_descriptor, ctx_t ctx);
 
 typedef uint64_t do_evict_t();
-void speculative_br(uint64_t flag, register void* ptr);
-extern uint8_t speculative_br_end;
+extern uint8_t speculative_br, speculative_br_x, speculative_br_end;
 
 #define DO_EVICT_T_NR_PARAMS 4
 typedef struct {
@@ -244,17 +243,14 @@ inline void init_ic_pp_descriptors(void **evset, pp_descriptors_t *o_descriptor,
 
 inline evict_stub_t *init_ic_ev_stub(void **evset, walk_descriptor_t *o_descriptor,
                                 ctx_t ctx, walk_descriptor_t *i_ev_flag) {
-    uint64_t size_x = (uint64_t)(&speculative_br_end) - (uint64_t)(&speculative_br);
-    uint64_t size_rwx = 0;
-    size_rwx += sizeof(uint64_t) * DO_EVICT_T_NR_PARAMS;
-    size_rwx += size_x;
-    evict_stub_t *evd = (evict_stub_t *) walk_descriptor_t_map_buffer(size_rwx, o_descriptor, ctx);
+    uint64_t size = (uint64_t)(&speculative_br_end) - (uint64_t)(&speculative_br);
+    evict_stub_t *evd = (evict_stub_t *) walk_descriptor_t_map_buffer(size, o_descriptor, ctx);
+    memcpy(evd, &speculative_br, size);
     evd->args[0] = (uint64_t) i_ev_flag->walk_buffer;
     evd->args[1] = (uint64_t) ctx.ev;
     evd->args[2] = 0xdeadbeef;
     evd->args[3] = 0xbeefdead;
-    memcpy(&(evd->snippet), &speculative_br, size_x);
-    __builtin___clear_cache((char *)&(evd->snippet), (char *)&(evd->snippet) + size_x);
+    __builtin___clear_cache((char *)&(evd->snippet), (char *)&(evd->snippet) + size);
     return evd;
 }
 
@@ -326,7 +322,7 @@ uint64_t prime_probe_ic(register walk_step_t *walkbuf_prime,
                         register evict_stub_t *do_evict,
                         register uint64_t repeat_evict) {
     register uint64_t evict_cntr = 0;
-    do_evict_t *do_evict_entry = ((void *)do_evict) + (DO_EVICT_T_NR_PARAMS * sizeof(uint64_t));
+    do_evict_t *do_evict_entry = ((do_evict_t *)do_evict);
     OPS_BARRIER(8);
     // Prime the cache set
     walk_wrapper_head(walkbuf_prime, repeat_prime);
@@ -335,6 +331,7 @@ uint64_t prime_probe_ic(register walk_step_t *walkbuf_prime,
     // do evict on demand!
     OPS_BARRIER(8);
     do_evict_entry();
+    NOP(0x40);
     OPS_BARRIER(8);
 
 #if defined(DBG_FLUSH_EVSET)
@@ -370,7 +367,8 @@ uint64_t prime_probe_launcher(pagemap_t pr, ctx_t *ctx, register uint64_t repeat
     ev_descriptors_t ev_desc;
     init_ic_pp_descriptors(prset, &pp_desc, *ctx);
     init_ic_ev_descriptors(prset, &ev_desc, *ctx);
-    evict_stub_t *ev_stub = (evict_stub_t *) ev_desc.ev_stub.walk_buffer;
+    uint64_t ev_stub_x_offset = &speculative_br_x - &speculative_br;
+    evict_stub_t *ev_stub = (evict_stub_t *) ((void*) ev_desc.ev_stub.walk_buffer + ev_stub_x_offset);
 
     register walk_step_t *walkbuf_probe = pp_desc.walk_probe.walk_buffer;
     register uint64_t repeat_prime = ctx->prime_repeat;
@@ -382,7 +380,6 @@ uint64_t prime_probe_launcher(pagemap_t pr, ctx_t *ctx, register uint64_t repeat
 
     // TODO: move this to init_ic_ev_descriptors and save it in a permanent address
     uint64_t ret_addr = (uint64_t) ev_desc.ev_stub.walk_buffer
-                        + sizeof(uint64_t) * DO_EVICT_T_NR_PARAMS
                         + (uint64_t)(&speculative_br_end) - (uint64_t)(&speculative_br)
                         - sizeof(uint32_t);
 
