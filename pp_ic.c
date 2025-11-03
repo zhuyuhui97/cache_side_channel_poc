@@ -335,6 +335,7 @@ uint64_t prime_probe_ic(register walk_step_t *walkbuf_prime,
     OPS_BARRIER(8);
 
 #if defined(DBG_FLUSH_EVSET)
+    // TODO: evset not defined here!
     for (int i = 0; i < nr_prime; i++) {
         FLUSH_ICACHE(evset[i]);
     }
@@ -353,10 +354,9 @@ uint64_t prime_probe_ic(register walk_step_t *walkbuf_prime,
 uint64_t prime_probe_launcher(pagemap_t pr, ctx_t *ctx, register uint64_t repeat) {
     void *ev = ctx->ev;
     void *pr_base = pr.p;
-    uint64_t pr_size = pr.size;
-    uint64_t nr_prime = args.cache_ways;
-    register uint64_t evict_cntr = 0;
+    register uint64_t nr_prime = args.cache_ways;
     register uint64_t threshold = args.threshold_ns;
+    register uint64_t evict_cntr = 0;
 
     get_prime_set(pr, ctx);
     void **prset = ctx->prime_set->list;
