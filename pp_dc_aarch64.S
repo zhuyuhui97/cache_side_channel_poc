@@ -17,6 +17,8 @@ walk_dc_prime:
     dsb sy
     isb
     mrs RLOC_PRE_EVCNT, pmevcntr0_el0
+    cmp RPAR_REPEAT, #0
+    b.eq return
 
 step:
     mov RLOC_VAL_BAK, RLOC_DPTR

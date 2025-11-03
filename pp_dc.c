@@ -217,12 +217,9 @@ pp_dc_reult prime_probe_dc(register walk_step_t *walkbuf_prime,
     walk_dc_prime(walkbuf_prime, nr_prime, repeat_prime);
     OPS_BARRIER(8);
 
-    // TODO: integrate the if statement into the asm snippet
-    if (args.do_eviction) { // do evict on demand!
-        OPS_BARRIER(8);
-        do_evict(walkbuf_ev, 1, repeat_evict);
-        OPS_BARRIER(8);
-    }
+    OPS_BARRIER(8);
+    do_evict(walkbuf_ev, 1, repeat_evict);
+    OPS_BARRIER(8);
 
 #if defined(DBG_FLUSH_EVSET)
     // TODO: prset not defined here!
@@ -362,7 +359,7 @@ int main(int argc, char **argv) {
             .ev = (void *)ptr,
             .prime_sweep = args.prime_sweep,
             .prime_repeat = args.prime_repeat,
-            .evict_repeat = args.evict_repeat,
+            .evict_repeat = args.do_eviction ? args.evict_repeat : 0,
             .dbg_print_res = args.verbose,
             .cache_entry_size = sizeof(walk_step_t),
             .args = &args
